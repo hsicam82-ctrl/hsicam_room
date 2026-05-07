@@ -1,52 +1,60 @@
-# BioTicker Enterprise - Technical Handover & Architecture Guide
+# BioTicker Enterprise - Technical Handover
 
-This document serves as a comprehensive technical overview and handover guide for the BioTicker Enterprise application.
+## Project Overview
 
-## 1. Project Overview
-BioTicker Enterprise is a full-stack real-time intelligence hub designed to aggregate, analyze, and notify healthcare industry news from 13+ specialized Korean news sources.
+BioTicker Enterprise is a full-stack intelligence dashboard for Korean healthcare, pharma, and bio industry news.
 
-- **Architecture**: Express.js (Backend) + React (Frontend - Vite)
-- **Primary Goal**: Detect new articles, perform AI analysis (Sentiment/Summary), and notify via Telegram.
+The intended workflow is:
 
-## 2. Technical Stack
-- **Frontend**: React 18, Tailwind CSS, Lucide React (Icons), Framer Motion (Animations), DayJS, React Day Picker (Calendar).
-- **Backend**: Node.js (via `tsx`), Express, Cheerio (Web Scraping), Axios, OpenAI/Gemini SDK.
-- **Storage**: File-based JSON storage (`articles.json`) optimized for containerized environments without dedicated DBs.
+1. The server periodically collects new articles from RSS and web sources.
+2. New articles are stored in `articles.json`.
+3. A user reviews the dashboard.
+4. Newly collected articles are automatically sent to Telegram.
+5. A user manually runs OpenAI GPT analysis on selected articles.
+6. A user can manually resend a Telegram alert when needed.
 
-## 3. Core Logic (Server-side: `server.ts`)
+Automatic collection and automatic Telegram delivery are enabled. Automatic AI analysis is intentionally disabled.
 
-### News Sources
-The app monitors the following sources via customized selectors:
-- 의협신문, 청년의사, 메디게이트, 데일리메디, 약사공론, 메디파나뉴스, etc.
+## Stack
 
-### The `fetchAndProcessNews` Workflow:
-1. **Scraping**: Parallel scraping of all `WEB_SOURCES` using Cheerio.
-2. **Deduplication**: Comparing incoming links against `articles.json` IDs.
-3. **Proactive Enrichment**: For new articles, it fetches the full content to extract precise timestamps (bypassing generic "YY-MM-DD" formats).
-4. **AI Processing**: New articles are analyzed using `models/gemini-1.5-flash` for:
-    - **Summary**: Concise 3-line bullet points.
-    - **Sentiment**: Neutral, Positive, or Negative.
-5. **Notification**: Dispatches real-time alerts to Telegram.
+- Frontend: React, Vite, Tailwind CSS, Lucide React, Motion, React Day Picker, XLSX
+- Backend: Express, Vite middleware, Axios, Cheerio, RSS Parser, OpenAI SDK, node-cron
+- Storage: local JSON file at `articles.json`
+- AI: OpenAI GPT via `OPENAI_API_KEY`
+- Notification: Telegram Bot API, manual trigger only
 
-## 4. Environment Variables
-To run this project, the following secrets must be configured:
-- `GEMINI_API_KEY`: For AI article analysis.
-- `TELEGRAM_BOT_TOKEN`: The bot token from @BotFather.
-- `TELEGRAM_CHAT_ID`: The target channel or user ID.
+## Main Files
 
-## 5. UI/UX Features (Client-side: `App.tsx`)
-- **Responsive Calendar**: Custom-styled `DayPicker` with mobile-first responsiveness.
-- **Dynamic Filtering**: Multi-condition filtering (Unread, Starred, Category, Date Range).
-- **Offline Reliability**: State-driven UI that handles sync errors gracefully.
+- `server.ts`: API server, scraping, JSON storage, automatic Telegram delivery, manual AI analysis
+- `src/App.tsx`: monitoring dashboard UI
+- `.env.example`: required environment variables
+- `articles.json`: local data store
 
-## 6. Manual Synchronization
-The `/api/articles/sync` endpoint handles manual triggers from the UI. It is now parallelized to ensure fast response times on mobile devices.
+## API Behavior
 
-## 7. Critical Maintenance Notes
-- **Port Mapping**: The server MUST listen on `0.0.0.0:3000`.
-- **Date Normalization**: All dates are normalized to `Asia/Seoul` time (KST) before being stored as ISO strings.
-- **Scraper Stability**: If a news source changes its layout, update `scrapeWebSource` or `fetchArticleContent` selectors in `server.ts`.
+- `GET /api/articles`: return stored articles
+- `POST /api/articles/sync`: collect news, store matching articles, and send new articles to Telegram once
+- `POST /api/articles/analysis`: manually analyze one article with OpenAI
+- `POST /api/articles/notify`: manually resend one article to Telegram
+- `POST /api/articles/star`: update starred state
+- `POST /api/articles/read`: update read state
+- `POST /api/articles/memo`: update memo
+- `POST /api/articles/clear`: clear data, requires `DELETE_ALL_ARTICLES`
+- `GET /api/health`: health check
 
----
-*Created on: 2026-05-07*
-*Author: BioTicker Dev System (AI AI Studio)*
+## Operational Notes
+
+- The server listens on `0.0.0.0:3000` by default.
+- Cron sync runs every 5 minutes, collects articles, and sends Telegram alerts for newly collected articles.
+- Duplicate Telegram sends are prevented with normalized link/title keys plus the stored `telegramSent` flag.
+- `fetchAndProcessNews` has a simple in-flight lock so manual and cron syncs do not overlap.
+- `saveArticles` writes through a temporary file before replacing `articles.json`.
+- If a source layout changes, update `scrapeWebSource` or `fetchArticleContent` in `server.ts`.
+
+## Recommended Next Improvements
+
+- Move from JSON file storage to SQLite or Firestore before multi-user deployment.
+- Add authentication before exposing destructive or notification endpoints outside localhost.
+- Add per-source scrape success metrics in the dashboard.
+- Add a keyword/watchlist settings UI for companies, products, and event types.
+- Add tests for date normalization, deduplication, filtering, and API mutations.

@@ -1,612 +1,732 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
-import OpenAI from "openai";
-import dotenv from "dotenv";
-import Parser from "rss-parser";
-import axios from "axios";
-import cron from "node-cron";
 import fs from "fs";
-
+import dotenv from "dotenv";
+import axios from "axios";
 import * as cheerio from "cheerio";
+import Parser from "rss-parser";
+import cron from "node-cron";
+import OpenAI from "openai";
 import dayjs from "dayjs";
 import utc from "dayjs/plugin/utc.js";
 import timezone from "dayjs/plugin/timezone.js";
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
-
 dotenv.config();
 
-const parser = new Parser({
-  headers: {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'application/rss+xml, application/xml, text/xml, */*'
-  },
-  timeout: 10000
-});
-const DB_PATH = path.join(process.cwd(), "articles.json");
+type Importance = "high" | "mid" | "low";
+type ArticleType =
+  | "approval"
+  | "clinical"
+  | "deal"
+  | "earnings"
+  | "pricing"
+  | "legal"
+  | "finance"
+  | "product"
+  | "etc";
 
-// --- Source Configuration ---
+interface Article {
+  id: string;
+  title: string;
+  link: string;
+  publishedAt: string | null;
+  fetchedAt: string;
+  source: string;
+  content: string;
+  isStarred: boolean;
+  isRead: boolean;
+  aiAnalyzed: boolean;
+  type: ArticleType;
+  importance: Importance;
+  reason: string;
+  summary: string;
+  memo: string;
+  telegramSent: boolean;
+  entities: {
+    companies: string[];
+    products: string[];
+  };
+}
+
+interface Source {
+  name: string;
+  url: string;
+  baseUrl?: string;
+}
+
+const PORT = Number(process.env.PORT || 3000);
+const DB_PATH = path.join(process.cwd(), "articles.json");
+const USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
 const INDUSTRY_KEYWORDS = [
-  '제약', '바이오', '신약', '의약품', '제약사', '바이오기업', '임상', '품목허가', '식약처', 'FDA', '기술이전', '라이선스', 'CDMO',
-  '허가', '승인', '품목', '치료제', '항암', '백신', 'GMP'
+  "제약",
+  "바이오",
+  "신약",
+  "의약품",
+  "헬스케어",
+  "임상",
+  "품목허가",
+  "식약처",
+  "FDA",
+  "기술이전",
+  "라이선스",
+  "CDMO",
+  "허가",
+  "승인",
+  "치료제",
+  "항암",
+  "백신",
+  "GMP",
 ];
 
 const EVENT_KEYWORDS = [
-  '실적', '매출', '영업이익', '임상', '임상시험', '허가', '승인', 'NDA', 'IND', '기술이전', '계약', '수주', '급여', '약가', '특허', 
-  '제네릭', '판매정지', '회수', '리콜', '투자', 'IPO', '공급계약', '파트너십', '행정처분', '제조정지', '업무정지', '과징금', '점검', 
-  '실사', '위반', '허가취소', '특허분쟁', '특허 소송', '무효', '무효심판', '침해', '회피', '소송', '판결', '가처분', '권리범위'
+  "실적",
+  "매출",
+  "영업이익",
+  "임상",
+  "임상시험",
+  "허가",
+  "승인",
+  "NDA",
+  "IND",
+  "기술이전",
+  "계약",
+  "수주",
+  "급여",
+  "약가",
+  "특허",
+  "시판",
+  "판매",
+  "회수",
+  "리콜",
+  "투자",
+  "IPO",
+  "공급계약",
+  "파트너십",
+  "행정처분",
+  "제조정지",
+  "업무정지",
+  "과징금",
+  "인수",
+  "합병",
+  "소송",
+  "무효",
+  "침해",
+  "출시",
 ];
 
-const RSS_SOURCES = [
-  { name: '약사공론', url: 'https://www.kpanews.co.kr/rss/allArticle.xml' },
-  { name: '팜뉴스', url: 'http://www.pharmnews.com/rss/allArticle.xml' },
-  { name: '매일경제', url: 'https://www.mk.co.kr/rss/30000023/' }
+const RSS_SOURCES: Source[] = [
+  { name: "약사공론", url: "https://www.kpanews.co.kr/rss/allArticle.xml" },
+  { name: "팜뉴스", url: "http://www.pharmnews.com/rss/allArticle.xml" },
+  { name: "매일경제", url: "https://www.mk.co.kr/rss/30000023/" },
 ];
 
-const WEB_SOURCES = [
-  { name: '데일리팜', url: 'https://www.dailypharm.com/Users/News/NewsList.html', baseUrl: 'https://www.dailypharm.com' },
-  { name: '히트뉴스', url: 'https://www.hitnews.co.kr/news/articleList.html?view_type=sm', baseUrl: 'https://www.hitnews.co.kr' },
-  { name: '더바이오', url: 'https://www.thebionews.net/', baseUrl: 'https://www.thebionews.net' },
-  { name: '프레스9', url: 'https://www.press9.kr/news/articleList.html?view_type=sm', baseUrl: 'https://www.press9.kr' },
-  { name: '메디팜스투데이', url: 'https://www.pharmstoday.com/news/articleList.html?view_type=sm', baseUrl: 'https://www.pharmstoday.com' },
-  { name: '헬스코리아뉴스', url: 'https://www.hkn24.com/news/articleList.html', baseUrl: 'https://www.hkn24.com' },
-  { name: '청년의사', url: 'https://www.docdocdoc.co.kr/news/articleList.html?sc_sub_section_code=S2N124', baseUrl: 'https://www.docdocdoc.co.kr' },
-  { name: '뉴스더보이스', url: 'https://www.newsthevoice.com/news/articleList.html', baseUrl: 'https://www.newsthevoice.com' },
-  { name: '메디칼타임즈', url: 'https://www.medicaltimes.com/Main/News/List.html?MainCate=3', baseUrl: 'https://www.medicaltimes.com' },
-  { name: '의학신문', url: 'https://www.bosa.co.kr/news/articleList.html?view_type=sm', baseUrl: 'https://www.bosa.co.kr' },
-  { name: '한국경제', url: 'https://www.hankyung.com/bioinsight', baseUrl: 'https://www.hankyung.com' },
-  { name: '서울경제', url: 'https://www.sedaily.com/NewsList/GD05', baseUrl: 'https://www.sedaily.com' },
-  { name: '조선헬스', url: 'https://health.chosun.com/list.html', baseUrl: 'https://health.chosun.com' },
-  { name: '메디팜뉴스', url: 'http://www.medipharmnews.com/news/articleList.html?view_type=sm', baseUrl: 'http://www.medipharmnews.com' },
-  { name: '라포르시안', url: 'https://www.rapportian.com/news/articleList.html?view_type=sm', baseUrl: 'https://www.rapportian.com' },
-  { name: '데일리메디', url: 'https://www.dailymedi.com/news/news_list.php', baseUrl: 'https://www.dailymedi.com' },
-  { name: '바이오타임즈', url: 'https://biotimes.co.kr/news/articleList.html?view_type=sm', baseUrl: 'https://biotimes.co.kr' },
-  { name: '메디게이트뉴스', url: 'https://www.medigatenews.com/news/list', baseUrl: 'https://www.medigatenews.com' },
-  { name: '의약뉴스', url: 'https://www.newsmp.com/news/articleList.html?view_type=sm', baseUrl: 'https://www.newsmp.com' },
-  { name: '메디소비자뉴스', url: 'https://www.medisobizanews.com/news/articleList.html?view_type=sm', baseUrl: 'https://www.medisobizanews.com' },
-  { name: '약업신문', url: 'https://www.yakup.com/news/index.html?mode=list', baseUrl: 'https://www.yakup.com' },
-  { name: '메디파나뉴스', url: 'https://www.medipana.com/news/articleList.html?view_type=sm', baseUrl: 'http://www.medipana.com' },
-  { name: '바이오스펙테이터', url: 'http://www.biospectator.com/section/section_list.php?code=1100', baseUrl: 'http://www.biospectator.com' },
-  { name: '팜이데일리', url: 'http://pharm.edaily.co.kr/News/NewsList', baseUrl: 'http://pharm.edaily.co.kr' },
-  { name: '매경헬스', url: 'https://www.mkhealth.co.kr/news/articleList.html?view_type=sm', baseUrl: 'https://www.mkhealth.co.kr' }
+const WEB_SOURCES: Source[] = [
+  { name: "데일리팜", url: "https://www.dailypharm.com/Users/News/NewsList.html", baseUrl: "https://www.dailypharm.com" },
+  { name: "히트뉴스", url: "https://www.hitnews.co.kr/news/articleList.html?view_type=sm", baseUrl: "https://www.hitnews.co.kr" },
+  { name: "더바이오", url: "https://www.thebionews.net/", baseUrl: "https://www.thebionews.net" },
+  { name: "프레스나인", url: "https://www.press9.kr/news/articleList.html?view_type=sm", baseUrl: "https://www.press9.kr" },
+  { name: "팜스투데이", url: "https://www.pharmstoday.com/news/articleList.html?view_type=sm", baseUrl: "https://www.pharmstoday.com" },
+  { name: "헬스코리아뉴스", url: "https://www.hkn24.com/news/articleList.html", baseUrl: "https://www.hkn24.com" },
+  { name: "청년의사", url: "https://www.docdocdoc.co.kr/news/articleList.html?sc_sub_section_code=S2N124", baseUrl: "https://www.docdocdoc.co.kr" },
+  { name: "뉴스더보이스", url: "https://www.newsthevoice.com/news/articleList.html", baseUrl: "https://www.newsthevoice.com" },
+  { name: "메디칼타임즈", url: "https://www.medicaltimes.com/Main/News/List.html?MainCate=3", baseUrl: "https://www.medicaltimes.com" },
+  { name: "의학신문", url: "https://www.bosa.co.kr/news/articleList.html?view_type=sm", baseUrl: "https://www.bosa.co.kr" },
+  { name: "한국경제", url: "https://www.hankyung.com/bioinsight", baseUrl: "https://www.hankyung.com" },
+  { name: "서울경제", url: "https://www.sedaily.com/NewsList/GD05", baseUrl: "https://www.sedaily.com" },
+  { name: "헬스조선", url: "https://health.chosun.com/list.html", baseUrl: "https://health.chosun.com" },
+  { name: "메디팜뉴스", url: "http://www.medipharmnews.com/news/articleList.html?view_type=sm", baseUrl: "http://www.medipharmnews.com" },
+  { name: "라포르시안", url: "https://www.rapportian.com/news/articleList.html?view_type=sm", baseUrl: "https://www.rapportian.com" },
+  { name: "데일리메디", url: "https://www.dailymedi.com/news/news_list.php", baseUrl: "https://www.dailymedi.com" },
+  { name: "바이오타임즈", url: "https://biotimes.co.kr/news/articleList.html?view_type=sm", baseUrl: "https://biotimes.co.kr" },
+  { name: "메디게이트뉴스", url: "https://www.medigatenews.com/news/list", baseUrl: "https://www.medigatenews.com" },
+  { name: "의약뉴스", url: "https://www.newsmp.com/news/articleList.html?view_type=sm", baseUrl: "https://www.newsmp.com" },
+  { name: "메디소비자뉴스", url: "https://www.medisobizanews.com/news/articleList.html?view_type=sm", baseUrl: "https://www.medisobizanews.com" },
+  { name: "약업신문", url: "https://www.yakup.com/news/index.html?mode=list", baseUrl: "https://www.yakup.com" },
+  { name: "메디파나뉴스", url: "https://www.medipana.com/news/articleList.html?view_type=sm", baseUrl: "https://www.medipana.com" },
+  { name: "바이오스펙테이터", url: "http://www.biospectator.com/section/section_list.php?code=1100", baseUrl: "http://www.biospectator.com" },
+  { name: "이데일리팜", url: "http://pharm.edaily.co.kr/News/NewsList", baseUrl: "http://pharm.edaily.co.kr" },
+  { name: "매경헬스", url: "https://www.mkhealth.co.kr/news/articleList.html?view_type=sm", baseUrl: "https://www.mkhealth.co.kr" },
 ];
 
-// Helper to normalize dates to ISO UTC while assuming Asia/Seoul for local strings
-const normalizeDate = (dateStr: string | null | undefined): string => {
-  if (!dateStr) return dayjs().toISOString();
-  
-  const cleanStr = dateStr.trim()
-    .replace(/[\[\]\(\)]/g, '')
-    .replace(/입력/g, '')
-    .replace(/발행/g, '')
-    .replace(/수정/g, '')
-    .replace(/\s+/g, ' ')
+const parser = new Parser({
+  headers: {
+    "User-Agent": USER_AGENT,
+    Accept: "application/rss+xml, application/xml, text/xml, */*",
+  },
+  timeout: 10000,
+});
+
+let syncInFlight: Promise<Article[]> | null = null;
+
+const normalizeDate = (value?: string | null): string => {
+  if (!value) return dayjs().toISOString();
+
+  const cleaned = value
+    .replace(/입력|수정|발행|등록|승인|기사입력/g, "")
+    .replace(/[\[\]\(\)]/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 
-  if (!cleanStr) return dayjs().toISOString();
+  if (!cleaned) return dayjs().toISOString();
 
+  const candidates = [
+    cleaned,
+    cleaned.replace(/\./g, "-"),
+    cleaned.replace(/(\d{2})-(\d{2})-(\d{2})/, "20$1-$2-$3"),
+  ];
+
+  for (const candidate of candidates) {
+    const parsed = dayjs.tz(candidate, "Asia/Seoul");
+    if (parsed.isValid()) return parsed.toISOString();
+  }
+
+  const fallback = dayjs(cleaned);
+  return fallback.isValid() ? fallback.toISOString() : dayjs().toISOString();
+};
+
+const toAbsoluteUrl = (link: string, source: Source): string => {
+  if (link.startsWith("http")) return link;
+  return new URL(link, source.baseUrl || source.url).toString();
+};
+
+const normalizeLinkKey = (link: string) => {
   try {
-    let d;
-    if (/^\d+$/.test(cleanStr)) {
-      d = dayjs(parseInt(cleanStr));
-    } else {
-      // Handle "2024.05.07 06:00" or "24.05.07 06:00"
-      const dotPattern = cleanStr.replace(/\./g, '-');
-      d = dayjs.tz(dotPattern, 'Asia/Seoul');
-      
-      // If it only has the date "2024-05-07", dayjs.tz will set time to 00:00.
-      // If the string length is short (e.g., YY-MM-DD), it might need help
-      if (!d.isValid()) {
-         d = dayjs(cleanStr);
-      }
-    }
-    return d.isValid() ? d.toISOString() : dayjs().toISOString();
-  } catch (e) {
-    return dayjs().toISOString();
+    const url = new URL(link);
+    const paramsToDrop = [
+      "utm_source",
+      "utm_medium",
+      "utm_campaign",
+      "utm_term",
+      "utm_content",
+      "fbclid",
+      "gclid",
+      "ref",
+    ];
+    paramsToDrop.forEach((param) => url.searchParams.delete(param));
+    url.hash = "";
+    return url.toString().replace(/\/$/, "").toLowerCase();
+  } catch {
+    return link.split("#")[0].replace(/\/$/, "").trim().toLowerCase();
   }
 };
 
-// Helper to load/save articles
-const loadArticles = (): any[] => {
-  try {
-    if (fs.existsSync(DB_PATH)) {
-      const data = JSON.parse(fs.readFileSync(DB_PATH, "utf-8"));
-      // Migration: Ensure new fields exist
-      let migrated = false;
-      const updated = data.map((a: any) => {
-        if (!a.fetchedAt && a.date) {
-          a.fetchedAt = a.date;
-          if (!a.publishedAt) a.publishedAt = a.date;
-          migrated = true;
-        }
-        return a;
-      });
-      if (migrated) {
-        saveArticles(updated);
-      }
-      return updated;
-    }
-  } catch (e) {
-    console.error("DB Load Error", e);
-  }
-  return [];
+const normalizeTitleKey = (title: string) =>
+  title
+    .replace(/\[[^\]]*]/g, "")
+    .replace(/\([^)]*\)/g, "")
+    .replace(/[“”"'`.,:;|]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+
+const getArticleDedupKey = (article: Pick<Article, "link" | "title" | "source">) =>
+  `${normalizeLinkKey(article.link)}|${article.source}|${normalizeTitleKey(article.title)}`;
+
+const getNotificationDedupKey = (article: Pick<Article, "link" | "title" | "source">) =>
+  `${normalizeLinkKey(article.link)}|${normalizeTitleKey(article.title)}`;
+
+const normalizeArticle = (article: Partial<Article> & Pick<Article, "title" | "link" | "source">): Article => {
+  const id = article.id || article.link;
+  const now = dayjs().toISOString();
+
+  return {
+    id,
+    title: article.title.trim(),
+    link: article.link,
+    publishedAt: article.publishedAt || article.fetchedAt || now,
+    fetchedAt: article.fetchedAt || now,
+    source: article.source,
+    content: article.content || "",
+    isStarred: Boolean(article.isStarred),
+    isRead: Boolean(article.isRead),
+    aiAnalyzed: Boolean(article.aiAnalyzed),
+    type: article.type || "etc",
+    importance: article.importance || "mid",
+    reason: article.reason || "",
+    summary: article.summary || "",
+    memo: article.memo || "",
+    telegramSent: Boolean(article.telegramSent),
+    entities: {
+      companies: Array.isArray(article.entities?.companies) ? article.entities.companies : [],
+      products: Array.isArray(article.entities?.products) ? article.entities.products : [],
+    },
+  };
 };
 
-const saveArticles = (articles: any[]) => {
+const loadArticles = (): Article[] => {
   try {
-    fs.writeFileSync(DB_PATH, JSON.stringify(articles.slice(0, 500), null, 2));
-  } catch (e) {
-    console.error("DB Save Error", e);
+    if (!fs.existsSync(DB_PATH)) return [];
+    const data = JSON.parse(fs.readFileSync(DB_PATH, "utf-8"));
+    if (!Array.isArray(data)) return [];
+    return data
+      .filter((article) => article?.title && article?.link && article?.source)
+      .map((article) =>
+        normalizeArticle({
+          ...article,
+          publishedAt: article.publishedAt || article.date || null,
+          fetchedAt: article.fetchedAt || article.date || dayjs().toISOString(),
+        }),
+      );
+  } catch (error) {
+    console.error("[DB] Load failed:", error);
+    return [];
   }
 };
 
-// Helper to send Telegram message
-async function sendTelegramNotification(article: any, isTest = false) {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
-
-  if (!token || !chatId) {
-    const errorPrefix = "[Telegram] Config missing";
-    console.log(`${errorPrefix}, skipping notification.`);
-    if (isTest) throw new Error(`${errorPrefix}. Check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env.`);
-    return;
-  }
-
-  let message = '';
-  if (isTest) {
-    message = `🧪 <b>[Telegram 알림 테스트]</b>\n\n` +
-              `✅ 시스템이 정상적으로 작동하고 있습니다.\n` +
-              `⏰ 테스트 시간: ${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm:ss')}\n` +
-              `🎯 대상: ${chatId}`;
-  } else {
-    const importanceLabel = article.importance === 'high' ? '🚨 [긴급/High]' : '🔔 [중요/Mid]';
-    const fetchedTime = article.fetchedAt ? dayjs(article.fetchedAt).tz('Asia/Seoul').format('YYYY-MM-DD HH:mm:ss') : '-';
-    const publishedTime = article.publishedAt ? dayjs(article.publishedAt).tz('Asia/Seoul').format('YYYY-MM-DD HH:mm:ss') : '발행 시간 확인 불가';
-
-    message = `${importanceLabel} ${article.title}\n\n` +
-              `📍 매체명: ${article.source}\n` +
-              `⏰ 발행: ${publishedTime}\n` +
-              `📥 수집: ${fetchedTime}\n\n` +
-              `💡 요약:\n${article.summary || article.reason || '요약 정보 없음'}\n\n` +
-              `🔗 원문 링크:\n${article.link}`;
-  }
-
+const saveArticles = (articles: Article[]) => {
   try {
-    const response = await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
-      chat_id: chatId,
-      text: message,
-      parse_mode: 'HTML',
-      disable_web_page_preview: false
-    });
-    console.log(`[Telegram] Sent ${isTest ? 'test message' : 'notification for: ' + article.id}`);
-    return { status: response.status, data: response.data };
-  } catch (e: any) {
-    const errorData = e.response?.data || { error: e.message };
-    const statusCode = e.response?.status || 500;
-    console.error(`[Telegram] Error sending message (${statusCode}):`, errorData);
-    throw { statusCode, errorData };
+    const normalized = articles
+      .map(normalizeArticle)
+      .sort((a, b) => new Date(b.publishedAt || b.fetchedAt).getTime() - new Date(a.publishedAt || a.fetchedAt).getTime())
+      .slice(0, 1000);
+    const tmpPath = `${DB_PATH}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(normalized, null, 2), "utf-8");
+    fs.renameSync(tmpPath, DB_PATH);
+  } catch (error) {
+    console.error("[DB] Save failed:", error);
   }
-}
+};
 
 async function fetchArticleContent(url: string) {
   try {
     const { data } = await axios.get(url, {
-      timeout: 8000,
-      headers: { 
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-      }
+      timeout: 9000,
+      headers: {
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+      },
     });
-    const $ = cheerio.load(data);
-    
-    // Exact date extraction for various CMS
-    const preciseDateStr = 
-      $('.info-text li:contains("입력"), .info-text:contains("입력"), .info-text').first().text().trim() ||
-      $('.byline em:contains("202"), .byline li:contains("202")').first().text().trim() ||
-      $('.article-head-info .date, .article-info .info-text').text().trim() ||
-      $('.date, .published-at, .entry-date, .time, .dated, .reg-date').first().text().trim() ||
-      $('meta[property="article:published_time"]').attr('content') ||
-      $('meta[name="pubdate"]').attr('content') ||
-      "";
 
-    // Common selectors for news content
-    const content = $('#article-view').text() || $('#news_content').text() || $('.article-body').text() || $('.view-content').text() || $('.news-view-content').text() || $('.at-content').text() || "";
-    
+    const $ = cheerio.load(data);
+    const preciseDate =
+      $("meta[property='article:published_time']").attr("content") ||
+      $("meta[name='pubdate']").attr("content") ||
+      $(".info-text, .article-info, .byline, .date, .published-at, .entry-date, .time, .reg-date")
+        .first()
+        .text()
+        .trim() ||
+      null;
+
+    const content = [
+      "#article-view",
+      "#news_content",
+      ".article-body",
+      ".view-content",
+      ".news-view-content",
+      ".article_view",
+      ".at-content",
+      "article",
+    ]
+      .map((selector) => $(selector).first().text().trim())
+      .find((text) => text.length > 80);
+
     return {
-      content: content.trim().slice(0, 3000),
-      preciseDate: preciseDateStr || null
+      content: (content || "").replace(/\s+/g, " ").trim().slice(0, 5000),
+      preciseDate,
     };
-  } catch (e) {
-    console.error(`[Scraper] Full content fetch failed for ${url}:`, e);
+  } catch (error: any) {
+    console.error(`[Scraper] Article fetch failed for ${url}: ${error.message}`);
     return { content: "", preciseDate: null };
   }
 }
 
-async function analyzeArticleContent(article: any) {
+async function analyzeArticleContent(article: Article) {
   if (!process.env.OPENAI_API_KEY) {
-    console.error("[AI] OPENAI_API_KEY is not set.");
-    throw new Error("OpenAI API 키가 설정되지 않았습니다. .env 파일이나 설정을 확인해주세요.");
+    throw new Error("OPENAI_API_KEY가 설정되어 있지 않습니다. .env 파일을 확인해주세요.");
   }
-  
-  try {
-    // If content is missing, try to fetch it first
-    let contentToAnalyze = article.content || "";
-    if (contentToAnalyze.length < 50) {
-      console.log(`[AI] Content too short, fetching full content for: ${article.title}`);
-      const { content: fetchedContent, preciseDate } = await fetchArticleContent(article.link);
-      if (fetchedContent) {
-        contentToAnalyze = fetchedContent;
-      }
-      if (preciseDate && (!article.publishedAt || article.publishedAt.includes('00:00:00'))) {
-        article.publishedAt = normalizeDate(preciseDate);
-      }
+
+  let contentToAnalyze = article.content;
+  const articlePatch: Partial<Article> = {};
+
+  if (contentToAnalyze.length < 80) {
+    const fetched = await fetchArticleContent(article.link);
+    if (fetched.content) {
+      contentToAnalyze = fetched.content;
+      articlePatch.content = fetched.content;
     }
-
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    const prompt = `제약바이오 전문 분석가로서 다음 기사를 분석하세요:
-    제목: ${article.title}
-    본문: ${contentToAnalyze.slice(0, 1500)}
-    
-    결과는 다음 JSON 형식으로만 응답하세요. "summary"는 반드시 하나의 문자열이어야 합니다:
-    {
-      "type": "approval/clinical/deal/earnings/pricing/legal/finance/product/etc 중 하나",
-      "importance": "high/mid/low 중 하나",
-      "reason": "중요도 선정 이유",
-      "summary": "핵심 내용을 상세히 5줄로 요약한 단일 문자열 (번호 매김 포함)",
-      "entities": { "companies": ["회사명"], "products": ["제품명"] }
-    }`;
-
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-      response_format: { type: "json_object" },
-    });
-
-    const aiData = JSON.parse(response.choices[0].message.content || "{}");
-    
-    // Safety check: Ensure summary is a string
-    if (aiData.summary && typeof aiData.summary === 'object') {
-      aiData.summary = Object.values(aiData.summary).join('\n');
+    if (fetched.preciseDate) {
+      articlePatch.publishedAt = normalizeDate(fetched.preciseDate);
     }
-
-    // Safety check: Ensure entities are arrays
-    if (aiData.entities) {
-      if (aiData.entities.companies && !Array.isArray(aiData.entities.companies)) {
-        aiData.entities.companies = typeof aiData.entities.companies === 'object' ? Object.values(aiData.entities.companies) : [];
-      }
-      if (aiData.entities.products && !Array.isArray(aiData.entities.products)) {
-        aiData.entities.products = typeof aiData.entities.products === 'object' ? Object.values(aiData.entities.products) : [];
-      }
-    } else {
-      aiData.entities = { companies: [], products: [] };
-    }
-
-    return aiData;
-  } catch (e) {
-    console.error(`[AI] Analysis failed for ${article.id}:`, e);
-    return null;
   }
+
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  const response = await openai.chat.completions.create({
+    model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+    response_format: { type: "json_object" },
+    messages: [
+      {
+        role: "system",
+        content:
+          "당신은 한국 제약/바이오 산업 전문 에디터입니다. 기사를 실무자가 빠르게 판단할 수 있게 분류하고 요약합니다. 반드시 JSON만 반환합니다.",
+      },
+      {
+        role: "user",
+        content: [
+          `제목: ${article.title}`,
+          `출처: ${article.source}`,
+          `본문: ${contentToAnalyze.slice(0, 3500) || "(본문 없음)"}`,
+          "",
+          "다음 JSON 스키마로 답하세요.",
+          '{ "type": "approval|clinical|deal|earnings|pricing|legal|finance|product|etc", "importance": "high|mid|low", "reason": "중요도 판단 근거 한 문장", "summary": "핵심 요약 3~5줄", "entities": { "companies": ["회사명"], "products": ["제품명"] } }',
+        ].join("\n"),
+      },
+    ],
+  });
+
+  const parsed = JSON.parse(response.choices[0].message.content || "{}");
+  const validTypes: ArticleType[] = ["approval", "clinical", "deal", "earnings", "pricing", "legal", "finance", "product", "etc"];
+  const validImportance: Importance[] = ["high", "mid", "low"];
+
+  return {
+    ...articlePatch,
+    type: validTypes.includes(parsed.type) ? parsed.type : "etc",
+    importance: validImportance.includes(parsed.importance) ? parsed.importance : "mid",
+    reason: typeof parsed.reason === "string" ? parsed.reason : "",
+    summary:
+      typeof parsed.summary === "string"
+        ? parsed.summary
+        : parsed.summary && typeof parsed.summary === "object"
+          ? Object.values(parsed.summary).join("\n")
+          : "",
+    entities: {
+      companies: Array.isArray(parsed.entities?.companies) ? parsed.entities.companies.filter(Boolean).map(String) : [],
+      products: Array.isArray(parsed.entities?.products) ? parsed.entities.products.filter(Boolean).map(String) : [],
+    },
+    aiAnalyzed: true,
+  } satisfies Partial<Article>;
 }
 
-async function scrapeWebSource(source: typeof WEB_SOURCES[0]) {
+async function scrapeWebSource(source: Source) {
   try {
-    const isDailyMedi = source.name === '데일리메디';
     const { data } = await axios.get(source.url, {
-      timeout: isDailyMedi ? 15000 : 10000,
-      headers: { 
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-        'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
-        'Referer': source.baseUrl
-      }
+      timeout: source.name === "데일리메디" ? 15000 : 10000,
+      headers: {
+        "User-Agent": USER_AGENT,
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        Referer: source.baseUrl || source.url,
+      },
     });
 
     const $ = cheerio.load(data);
-    const items: any[] = [];
-    const now = dayjs().tz('Asia/Seoul');
+    const items: Partial<Article>[] = [];
 
-    // Site-specific logic for high accuracy
-    if (source.name === '데일리메디') {
-      $('.art_list_all li').each((_, el) => {
-        const title = $(el).find('.art_tit').text().trim();
-        const link = $(el).find('a').attr('href');
-        const dateStr = $(el).find('.art_date').text().trim(); // "24-05-07 07:11"
-        if (title && link) {
-          items.push({ title, link: link.startsWith('http') ? link : `${source.baseUrl}${link}`, isoDate: normalizeDate(dateStr), contentSnippet: "" });
-        }
+    const pushItem = (title?: string, link?: string, date?: string, content?: string) => {
+      const cleanTitle = (title || "").replace(/\s+/g, " ").trim();
+      if (!cleanTitle || !link || cleanTitle.length < 5) return;
+      const absoluteLink = toAbsoluteUrl(link, source);
+      items.push({
+        id: absoluteLink,
+        title: cleanTitle,
+        link: absoluteLink,
+        source: source.name,
+        publishedAt: normalizeDate(date),
+        fetchedAt: dayjs().toISOString(),
+        content: content || "",
       });
-    } else if (source.name === '약업신문') {
-      $('.news-list > li').each((_, el) => {
-        const title = $(el).find('.tit').text().trim();
-        const link = $(el).find('a').attr('href');
-        const dateStr = $(el).find('.date').text().trim();
-        if (title && link) {
-          items.push({ title, link: link.startsWith('http') ? link : `${source.baseUrl}${link.startsWith('/') ? '' : '/'}${link}`, isoDate: normalizeDate(dateStr), contentSnippet: "" });
-        }
+    };
+
+    if (source.name === "데일리팜") {
+      $(".art_list_all li").each((_, el) => {
+        pushItem($(el).find(".art_tit").text(), $(el).find("a").attr("href"), $(el).find(".art_date").text());
       });
-    } else if (source.name === '청년의사' || source.name === '메디파나뉴스') {
-      $('.article-list-content .list-item').each((_, el) => {
-        const title = $(el).find('.list-titles').text().trim();
-        const link = $(el).find('a').attr('href');
-        const dateStr = $(el).find('.list-dated, .byline').text().trim() || $(el).find('.byline li').last().text().trim();
-        if (title && link) {
-          items.push({ title, link: link.startsWith('http') ? link : `${source.baseUrl}${link}`, isoDate: normalizeDate(dateStr), contentSnippet: "" });
-        }
-      });
-    } else if (source.name === '라포르시안' || source.name === '히트뉴스' || source.name === '뉴스더보이스' || source.name === '의학신문') {
-      $('.article-list-content .list-item, .item, li').each((_, el) => {
-        const title = $(el).find('.list-titles, .tit, .title, a').first().text().trim();
-        const link = $(el).find('a').attr('href');
-        const dateStr = $(el).find('.list-dated, .date, .dated, .reg-date, .byline').text().trim();
-        if (title.length > 5 && link) {
-          items.push({ title, link: link.startsWith('http') ? link : `${source.baseUrl}${link}`, isoDate: normalizeDate(dateStr), contentSnippet: "" });
-        }
+    } else if (source.name === "약업신문") {
+      $(".news-list > li, .newsList li").each((_, el) => {
+        pushItem($(el).find(".tit, .title, a").first().text(), $(el).find("a").attr("href"), $(el).find(".date").text());
       });
     } else {
-      // General fall-back pattern
       const selectors = [
-        '.list-titles em a', '.list-titles a', '.titles a', '.title a',
-        '.art-title a', '.list-table .list-titles a', '.item-title a',
-        '#article-list a.title', '.news-list a', '.list-item a', '.type-2 a',
-        'h4 a', '.newsList a', '.list_title a'
-      ].join(', ');
+        ".list-titles a",
+        ".titles a",
+        ".title a",
+        ".art-title a",
+        ".item-title a",
+        "#article-list a.title",
+        ".news-list a",
+        ".list-item a",
+        ".type-2 a",
+        "h4 a",
+        ".newsList a",
+        ".list_title a",
+        "a[href*='article']",
+        "a[href*='news']",
+      ].join(", ");
 
       $(selectors).each((_, el) => {
-        const title = $(el).text().trim();
-        let link = $(el).attr('href');
-        
-        if (title && link && title.length > 5) {
-          if (!link.startsWith('http')) {
-            link = source.baseUrl + (link.startsWith('/') ? '' : '/') + link;
-          }
-          
-          // Try to find a date sibling in the same bucket
-          let dateStr = $(el).parent().find('.date, .time, .dated, .reg-date, .byline').text().trim() || 
-                        $(el).closest('li, div').find('.date, .time, .dated, .reg-date, .byline').text().trim();
-
-          if (link.includes('article') || link.includes('news') || link.includes('view') || link.includes('Article') || link.includes('Read') || link.includes('List')) {
-            items.push({
-              title,
-              link,
-              isoDate: normalizeDate(dateStr),
-              contentSnippet: ""
-            });
-          }
-        }
+        const link = $(el).attr("href");
+        const bucket = $(el).closest("li, article, div");
+        const date = bucket.find(".date, .time, .dated, .reg-date, .byline").first().text();
+        const snippet = bucket.find(".lead, .summary, .desc, p").first().text();
+        pushItem($(el).text(), link, date, snippet);
       });
     }
 
-    return items.slice(0, 15);
-  } catch (e: any) {
-    console.error(`[Scraper] ${source.name} failed: ${e.message}`);
+    const seen = new Set<string>();
+    return items
+      .filter((item) => {
+        if (!item.link || seen.has(item.link)) return false;
+        seen.add(item.link);
+        return true;
+      })
+      .slice(0, 15)
+      .map((item) => normalizeArticle(item as Article));
+  } catch (error: any) {
+    console.error(`[Scraper] ${source.name} failed: ${error.message}`);
     return [];
   }
 }
 
+const isRelevantArticle = (article: Article) => {
+  const text = `${article.title} ${article.content}`.toLowerCase();
+  const hasIndustry = INDUSTRY_KEYWORDS.some((keyword) => text.includes(keyword.toLowerCase()));
+  const hasEvent = EVENT_KEYWORDS.some((keyword) => text.includes(keyword.toLowerCase()));
+  return hasIndustry && hasEvent;
+};
+
 async function fetchAndProcessNews() {
-  console.log("[Fetcher] Starting comprehensive news sync process...");
-  
-  const allArticles: any[] = [];
-  
-  // 1. Fetch RSS Sources
-  for (const source of RSS_SOURCES) {
-    try {
-      console.log(`[Fetcher] Requesting RSS: ${source.name}`);
-      const feed = await parser.parseURL(source.url);
-      feed.items?.forEach(item => {
-        allArticles.push({
-          id: item.guid || item.link,
-          title: item.title,
-          link: item.link,
-          publishedAt: normalizeDate(item.isoDate || item.pubDate),
-          fetchedAt: dayjs().toISOString(),
-          source: source.name,
-          content: item.contentSnippet || item.content || "",
-          isStarred: false,
-          isRead: false,
-          memo: "",
-          telegramSent: false
+  if (syncInFlight) return syncInFlight;
+
+  syncInFlight = (async () => {
+    console.log("[Fetcher] News sync started.");
+    const allArticles: Article[] = [];
+
+    for (const source of RSS_SOURCES) {
+      try {
+        const feed = await parser.parseURL(source.url);
+        feed.items?.forEach((item) => {
+          if (!item.title || !item.link) return;
+          allArticles.push(
+            normalizeArticle({
+              id: item.guid || item.link,
+              title: item.title,
+              link: item.link,
+              publishedAt: normalizeDate(item.isoDate || item.pubDate),
+              fetchedAt: dayjs().toISOString(),
+              source: source.name,
+              content: item.contentSnippet || item.content || "",
+            }),
+          );
         });
-      });
-    } catch (e: any) {
-      console.error(`[Fetcher] RSS ${source.name} error: ${e.message}`);
-    }
-  }
-
-  // 2. Fetch Web Sources (Scraping) - Parallelized
-  console.log(`[Fetcher] Scraping ${WEB_SOURCES.length} web sources in parallel...`);
-  const webResults = await Promise.allSettled(WEB_SOURCES.map(async (source) => {
-    const items = await scrapeWebSource(source);
-    return items.map(item => ({
-      id: item.link, // For scraped items, link is id
-      title: item.title,
-      link: item.link,
-      publishedAt: normalizeDate(item.isoDate),
-      fetchedAt: dayjs().toISOString(),
-      source: source.name,
-      content: item.contentSnippet,
-      isStarred: false,
-      isRead: false,
-      memo: "",
-      telegramSent: false
-    }));
-  }));
-
-  webResults.forEach((result, idx) => {
-    if (result.status === 'fulfilled') {
-      allArticles.push(...result.value);
-    } else {
-      console.error(`[Fetcher] Scraping ${WEB_SOURCES[idx].name} failed critically:`, result.reason);
-    }
-  });
-
-  const existingArticles = loadArticles();
-  const existingIds = new Set(existingArticles.map(a => a.id));
-  
-  // Filtering and Deduplication
-  const newItems = allArticles.filter(a => {
-    if (!a.id || existingIds.has(a.id)) return false;
-    
-    const combinedText = (a.title + " " + a.content).toLowerCase();
-    
-    // 1. Must be related to Industry
-    const hasIndustry = INDUSTRY_KEYWORDS.some(kw => combinedText.includes(kw.toLowerCase()));
-    
-    // 2. Must be an Event
-    const hasEvent = EVENT_KEYWORDS.some(kw => combinedText.includes(kw.toLowerCase()));
-
-    // Strict filter: Must satisfy BOTH industry context AND specific event/trigger
-    return hasIndustry && hasEvent;
-  });
-  
-  // Deduplicate within the new batch by title
-  const uniqueNewItems = newItems.filter((v, i, a) => a.findIndex(t => t.title === v.title) === i);
-
-  console.log(`[Fetcher] Found ${uniqueNewItems.length} new unique articles.`);
-
-  if (uniqueNewItems.length > 0) {
-    // Automatically notify and Fetch precise date for new articles - Parallelized (max 5 at a time to be polite)
-    const processBatch = async (items: any[]) => {
-      for (let i = 0; i < items.length; i += 5) {
-        const batch = items.slice(i, i + 5);
-        await Promise.allSettled(batch.map(async (article) => {
-          try {
-            // PROACTIVE: Fetch full content to get precise date from the article page
-            const { content, preciseDate } = await fetchArticleContent(article.link);
-            if (preciseDate) {
-              article.publishedAt = normalizeDate(preciseDate);
-            }
-            if (content) {
-              article.content = content;
-            }
-            await sendTelegramNotification(article);
-            article.telegramSent = true;
-          } catch (e: any) {
-            console.error(`[Processor] Failed to process/notify for ${article.id}:`, e.message);
-          }
-        }));
+      } catch (error: any) {
+        console.error(`[Fetcher] RSS ${source.name} failed: ${error.message}`);
       }
-    };
+    }
 
-    await processBatch(uniqueNewItems);
-
-    const finalArticles = [...uniqueNewItems, ...existingArticles].sort((a, b) => {
-      const timeA = new Date(a.publishedAt || a.fetchedAt).getTime();
-      const timeB = new Date(b.publishedAt || b.fetchedAt).getTime();
-      return timeB - timeA;
+    const webResults = await Promise.allSettled(WEB_SOURCES.map((source) => scrapeWebSource(source)));
+    webResults.forEach((result) => {
+      if (result.status === "fulfilled") allArticles.push(...result.value);
     });
-    saveArticles(finalArticles.slice(0, 1000));
-    return uniqueNewItems;
+
+    const existingArticles = loadArticles();
+    const existingIds = new Set(existingArticles.map((article) => article.id));
+    const existingArticleKeys = new Set(existingArticles.map(getArticleDedupKey));
+    const sentNotificationKeys = new Set(
+      existingArticles.filter((article) => article.telegramSent).map(getNotificationDedupKey),
+    );
+    const newArticles = allArticles.filter(
+      (article) => !existingIds.has(article.id) && !existingArticleKeys.has(getArticleDedupKey(article)) && isRelevantArticle(article),
+    );
+    const uniqueNewArticles = newArticles.filter(
+      (article, index, list) =>
+        list.findIndex(
+          (target) =>
+            getArticleDedupKey(target) === getArticleDedupKey(article) ||
+            getNotificationDedupKey(target) === getNotificationDedupKey(article),
+        ) === index,
+    );
+
+    if (uniqueNewArticles.length > 0) {
+      for (let i = 0; i < uniqueNewArticles.length; i += 5) {
+        const batch = uniqueNewArticles.slice(i, i + 5);
+        await Promise.allSettled(
+          batch.map(async (article) => {
+            const fetched = await fetchArticleContent(article.link);
+            if (fetched.content) article.content = fetched.content;
+            if (fetched.preciseDate) article.publishedAt = normalizeDate(fetched.preciseDate);
+          }),
+        );
+      }
+
+      for (const article of uniqueNewArticles) {
+        const notificationKey = getNotificationDedupKey(article);
+        if (sentNotificationKeys.has(notificationKey)) {
+          article.telegramSent = true;
+          console.log(`[Telegram] Skipped duplicate notification: ${article.title}`);
+          continue;
+        }
+
+        try {
+          await sendTelegramNotification(article);
+          article.telegramSent = true;
+          sentNotificationKeys.add(notificationKey);
+        } catch (error: any) {
+          article.telegramSent = false;
+          console.error(`[Telegram] Auto notification failed for ${article.id}: ${error.message || error}`);
+        }
+      }
+    }
+
+    const finalArticles = [...uniqueNewArticles, ...existingArticles];
+    saveArticles(finalArticles);
+    console.log(`[Fetcher] News sync finished. New articles: ${uniqueNewArticles.length}`);
+    return uniqueNewArticles;
+  })();
+
+  try {
+    return await syncInFlight;
+  } finally {
+    syncInFlight = null;
   }
-  
-  return [];
+}
+
+async function sendTelegramNotification(article: Article, isTest = false) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+
+  if (!token || !chatId) {
+    throw new Error("TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID가 설정되어 있지 않습니다.");
+  }
+
+  const message = isTest
+    ? `<b>[BioTicker 테스트]</b>\n\n텔레그램 연결이 정상입니다.\n시간: ${dayjs().tz("Asia/Seoul").format("YYYY-MM-DD HH:mm:ss")}`
+    : [
+        `<b>[${article.importance.toUpperCase()}] ${article.title}</b>`,
+        "",
+        `출처: ${article.source}`,
+        `발행: ${article.publishedAt ? dayjs(article.publishedAt).tz("Asia/Seoul").format("YYYY-MM-DD HH:mm:ss") : "확인 불가"}`,
+        `분류: ${article.type}`,
+        "",
+        article.summary ? `<b>요약</b>\n${article.summary}` : article.reason ? `<b>판단 근거</b>\n${article.reason}` : "아직 AI 분석 요약이 없습니다.",
+        "",
+        article.link,
+      ].join("\n");
+
+  const response = await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
+    chat_id: chatId,
+    text: message,
+    parse_mode: "HTML",
+    disable_web_page_preview: false,
+  });
+
+  return response.data;
 }
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  app.use(express.json({ limit: "1mb" }));
 
-  app.use(express.json());
-
-  // Background Task: Every 5 minutes
   cron.schedule("*/5 * * * *", () => {
-    console.log(`[Cron] [${dayjs().tz('Asia/Seoul').format('YYYY-MM-DD HH:mm:ss')}] Periodic sync triggered.`);
-    fetchAndProcessNews();
+    console.log(`[Cron] ${dayjs().tz("Asia/Seoul").format("YYYY-MM-DD HH:mm:ss")} sync triggered.`);
+    fetchAndProcessNews().catch((error) => console.error("[Cron] Sync failed:", error));
   });
 
-  // Run once on startup if DB is empty
-  const initialData = loadArticles();
-  if (initialData.length === 0) {
-    fetchAndProcessNews();
+  if (loadArticles().length === 0) {
+    fetchAndProcessNews().catch((error) => console.error("[Startup] Initial sync failed:", error));
   }
 
-  // --- API Routes ---
-
-  app.get("/api/articles", (req, res) => {
+  app.get("/api/articles", (_req, res) => {
     res.json(loadArticles());
   });
 
-  app.post("/api/articles/sync", async (req, res) => {
+  app.post("/api/articles/sync", async (_req, res) => {
     try {
-      await fetchAndProcessNews();
-      res.json({ status: "ok", data: loadArticles() });
-    } catch (e: any) {
-      console.error("[API] Sync Failed:", e);
-      res.status(500).json({ status: "error", error: e.message });
+      const newArticles = await fetchAndProcessNews();
+      res.json({ status: "ok", newCount: newArticles.length, data: loadArticles() });
+    } catch (error: any) {
+      res.status(500).json({ status: "error", error: error.message || "뉴스 수집 중 오류가 발생했습니다." });
     }
   });
 
   app.post("/api/articles/star", (req, res) => {
     const { id, isStarred } = req.body;
     const articles = loadArticles();
-    const index = articles.findIndex(a => a.id === id);
-    if (index > -1) {
-      articles[index].isStarred = isStarred;
-      saveArticles(articles);
-      res.json(articles[index]);
-    } else {
-      res.status(404).json({ error: "Not found", receivedId: id });
-    }
+    const index = articles.findIndex((article) => article.id === id);
+    if (index === -1) return res.status(404).json({ error: "기사를 찾을 수 없습니다.", receivedId: id });
+    articles[index].isStarred = Boolean(isStarred);
+    saveArticles(articles);
+    res.json(articles[index]);
   });
 
-  app.post("/api/articles/clear", (req, res) => {
-    saveArticles([]);
-    res.json({ message: "Cleared" });
-  });
-
-  app.post("/api/articles/analysis", async (req, res) => {
-    const { id } = req.body;
+  app.post("/api/articles/read", (req, res) => {
+    const { id, isRead } = req.body;
     const articles = loadArticles();
-    const index = articles.findIndex(a => a.id === id);
-    if (index === -1) return res.status(404).json({ error: "Not found", receivedId: id });
-
-    try {
-      const article = articles[index];
-      const aiResult = await analyzeArticleContent(article);
-      
-      if (aiResult) {
-        articles[index] = { ...article, ...aiResult, aiAnalyzed: true };
-        
-        // Send updated notification after manual analysis if it was already sent or if high importance
-        if (articles[index].telegramSent || articles[index].importance === 'high') {
-          console.log(`[Analysis] Sending summary for: ${articles[index].title}`);
-          await sendTelegramNotification(articles[index]);
-          articles[index].telegramSent = true;
-        }
-        
-        saveArticles(articles);
-        res.json(articles[index]);
-      } else {
-        res.status(500).json({ error: "AI 분석 결과가 비어있습니다. 본문 수집에 실패했거나 모델 응답 오류일 수 있습니다." });
-      }
-    } catch (e: any) {
-      console.error("Manual Analysis Error:", e);
-      res.status(500).json({ error: e.message || "AI 분석 중 오류가 발생했습니다." });
-    }
+    const index = articles.findIndex((article) => article.id === id);
+    if (index === -1) return res.status(404).json({ error: "기사를 찾을 수 없습니다.", receivedId: id });
+    articles[index].isRead = Boolean(isRead);
+    saveArticles(articles);
+    res.json(articles[index]);
   });
 
   app.post("/api/articles/memo", (req, res) => {
     const { id, memo } = req.body;
     const articles = loadArticles();
-    const index = articles.findIndex(a => a.id === id);
-    if (index > -1) {
-      articles[index].memo = memo;
+    const index = articles.findIndex((article) => article.id === id);
+    if (index === -1) return res.status(404).json({ error: "기사를 찾을 수 없습니다.", receivedId: id });
+    articles[index].memo = String(memo || "");
+    saveArticles(articles);
+    res.json(articles[index]);
+  });
+
+  app.post("/api/articles/analysis", async (req, res) => {
+    const { id } = req.body;
+    const articles = loadArticles();
+    const index = articles.findIndex((article) => article.id === id);
+    if (index === -1) return res.status(404).json({ error: "기사를 찾을 수 없습니다.", receivedId: id });
+
+    try {
+      const aiResult = await analyzeArticleContent(articles[index]);
+      articles[index] = normalizeArticle({ ...articles[index], ...aiResult });
       saveArticles(articles);
       res.json(articles[index]);
-    } else {
-      res.status(404).json({ error: "Not found", receivedId: id });
+    } catch (error: any) {
+      console.error("[AI] Manual analysis failed:", error);
+      res.status(500).json({ error: error.message || "AI 분석 중 오류가 발생했습니다." });
     }
   });
 
-  // Health Check
-  app.get("/api/health", (req, res) => {
-    res.json({ status: "ok" });
+  app.post("/api/articles/notify", async (req, res) => {
+    const { id } = req.body;
+    const articles = loadArticles();
+    const index = articles.findIndex((article) => article.id === id);
+    if (index === -1) return res.status(404).json({ error: "기사를 찾을 수 없습니다.", receivedId: id });
+
+    try {
+      await sendTelegramNotification(articles[index]);
+      articles[index].telegramSent = true;
+      saveArticles(articles);
+      res.json(articles[index]);
+    } catch (error: any) {
+      console.error("[Telegram] Manual notification failed:", error);
+      res.status(500).json({ error: error.message || "텔레그램 전송 중 오류가 발생했습니다." });
+    }
   });
 
-  // --- Vite Middleware ---
+  app.post("/api/telegram/test", async (_req, res) => {
+    try {
+      await sendTelegramNotification(loadArticles()[0] || normalizeArticle({ title: "테스트", link: "https://example.com", source: "BioTicker" }), true);
+      res.json({ status: "ok" });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message || "텔레그램 테스트 중 오류가 발생했습니다." });
+    }
+  });
+
+  app.post("/api/articles/clear", (req, res) => {
+    if (req.body?.confirm !== "DELETE_ALL_ARTICLES") {
+      return res.status(400).json({ error: "삭제 확인 문구가 올바르지 않습니다." });
+    }
+    saveArticles([]);
+    res.json({ message: "cleared" });
+  });
+
+  app.get("/api/health", (_req, res) => {
+    res.json({ status: "ok", time: dayjs().toISOString() });
+  });
+
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -616,14 +736,17 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get("*", (req, res) => {
+    app.get("*", (_req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`BioTicker server running on http://localhost:${PORT}`);
   });
 }
 
-startServer();
+startServer().catch((error) => {
+  console.error("[Server] Failed to start:", error);
+  process.exit(1);
+});

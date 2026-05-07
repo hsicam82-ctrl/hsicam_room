@@ -1,21 +1,26 @@
 {
   "entities": {
     "Article": {
-      "title": "제약바이오 뉴스 기사",
-      "description": "자동 수집 및 AI 분석된 뉴스 기사 정보",
+      "title": "제약/바이오 뉴스 기사",
+      "description": "수집된 뉴스 기사와 수동 OpenAI 분석 결과",
       "type": "object",
       "properties": {
         "id": { "type": "string" },
         "title": { "type": "string" },
         "link": { "type": "string" },
-        "date": { "type": "string", "format": "date-time" },
+        "publishedAt": { "type": ["string", "null"], "format": "date-time" },
+        "fetchedAt": { "type": "string", "format": "date-time" },
         "source": { "type": "string" },
         "content": { "type": "string" },
         "type": { "type": "string", "enum": ["approval", "clinical", "deal", "earnings", "pricing", "legal", "finance", "product", "etc"] },
         "importance": { "type": "string", "enum": ["high", "mid", "low"] },
         "reason": { "type": "string" },
         "summary": { "type": "string" },
-        "status": { "type": "string", "enum": ["취재 필요", "추가 취재 중", "기사화 완료", "보류"] },
+        "memo": { "type": "string" },
+        "isStarred": { "type": "boolean" },
+        "isRead": { "type": "boolean" },
+        "aiAnalyzed": { "type": "boolean" },
+        "telegramSent": { "type": "boolean" },
         "entities": {
           "type": "object",
           "properties": {
@@ -24,13 +29,13 @@
           }
         }
       },
-      "required": ["id", "title", "link", "date", "source", "importance"]
+      "required": ["id", "title", "link", "fetchedAt", "source", "importance"]
     }
   },
   "firestore": {
     "/articles/{articleId}": {
       "schema": "Article",
-      "description": "수집된 뉴스 기사 컬렉션"
+      "description": "수집 기사와 수동 분석 결과 컬렉션"
     }
   }
 }
