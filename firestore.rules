@@ -1,0 +1,43 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 256;
+    }
+
+    // Article rules
+    match /articles/{articleId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn();
+      allow update: if isSignedIn();
+      allow delete: if isSignedIn();
+    }
+
+    // Notification logs
+    match /notifications/{logId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn();
+    }
+
+    // Sync logs
+    match /syncLogs/{logId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn();
+    }
+
+    // Metadata
+    match /metadata/{metaId} {
+      allow read: if isSignedIn();
+      allow write: if isSignedIn();
+    }
+  }
+}

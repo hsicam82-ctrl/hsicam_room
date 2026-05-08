@@ -47,6 +47,8 @@ interface NewsArticle {
   title: string;
   link: string;
   publishedAt: string | null;
+  rssPublishedAt: string | null;
+  publishedAtSource: string;
   fetchedAt: string;
   date?: string;
   source: string;
@@ -79,6 +81,8 @@ const CATEGORIES: Array<{ id: ArticleType | "all"; label: string; icon: React.Co
   { id: "etc", label: "기타", icon: FileText },
 ];
 
+// Importance labels and styles removed as requested
+/* 
 const IMPORTANCE_LABELS: Record<Importance, string> = {
   high: "High",
   mid: "Mid",
@@ -90,6 +94,7 @@ const IMPORTANCE_STYLES: Record<Importance, string> = {
   mid: "bg-amber-50 text-amber-700 border-amber-200",
   low: "bg-slate-100 text-slate-600 border-slate-200",
 };
+*/
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -97,12 +102,29 @@ function cn(...inputs: ClassValue[]) {
 
 function formatKST(dateStr: string | null | undefined, formatStr = "YYYY-MM-DD HH:mm") {
   if (!dateStr) return "확인 불가";
-  const parsed = dayjs.utc(dateStr).tz("Asia/Seoul");
-  return parsed.isValid() ? parsed.format(formatStr) : "확인 불가";
+  try {
+    const hasTimezone = /(Z|[+\-]\d{2}:?\d{2})$/.test(dateStr);
+    
+    let parsed;
+    if (hasTimezone) {
+      // If timezone info exists, interpret and convert to Seoul
+      parsed = dayjs(dateStr).tz("Asia/Seoul");
+    } else {
+      // If no timezone info, treat as UTC first then to Seoul is Risky as per user request.
+      // User requested: "timezone 정보가 없으면 dayjs.tz(dateStr, 'Asia/Seoul') 사용"
+      parsed = dayjs.tz(dateStr, "Asia/Seoul");
+    }
+    
+    return parsed.isValid() ? parsed.format(formatStr) : "확인 불가";
+  } catch (e) {
+    return "확인 불가";
+  }
 }
 
 function getArticleTime(article: NewsArticle) {
-  return new Date(article.publishedAt || article.fetchedAt || article.date || 0).getTime();
+  // Priority: publishedAt > fetchedAt
+  if (article.publishedAt) return new Date(article.publishedAt).getTime();
+  return new Date(article.fetchedAt || 0).getTime();
 }
 
 function normalizeForCluster(title: string) {
@@ -123,23 +145,37 @@ function clusterArticles(articles: NewsArticle[]) {
     if (processed.has(article.id)) return;
 
     const rootTitle = normalizeForCluster(article.title);
-    const rootWords = rootTitle.split(" ").filter((word) => word.length > 1);
+    const rootWords = rootTitle.split(" ").filter((word) => word.length >= 2);
+    const rootEntities = [...(article.entities?.companies || []), ...(article.entities?.products || [])].map(e => e.toLowerCase());
+    const rootTime = getArticleTime(article);
     const cluster = [article];
     processed.add(article.id);
 
     sorted.forEach((candidate) => {
       if (processed.has(candidate.id)) return;
-      const candidateTitle = normalizeForCluster(candidate.title);
-      const candidateWords = candidateTitle.split(" ").filter((word) => word.length > 1);
-      const overlap = rootWords.filter((word) => candidateWords.includes(word)).length;
-      const similarity = overlap / Math.max(1, Math.min(rootWords.length, candidateWords.length));
-      const rootPrefix = rootTitle.slice(0, 12);
-      const candidatePrefix = candidateTitle.slice(0, 12);
-      const hasPrefixMatch =
-        (rootPrefix.length >= 8 && candidateTitle.includes(rootPrefix)) ||
-        (candidatePrefix.length >= 8 && rootTitle.includes(candidatePrefix));
+      
+      // Condition 1: 24h window
+      const candidateTime = getArticleTime(candidate);
+      if (Math.abs(rootTime - candidateTime) > 24 * 60 * 60 * 1000) return;
 
-      if (similarity >= 0.75 || hasPrefixMatch) {
+      const candidateTitle = normalizeForCluster(candidate.title);
+      const candidateWords = candidateTitle.split(" ").filter((word) => word.length >= 2);
+      
+      // Condition 2: Noun overlap (title keywords)
+      // Exclude generic boring words
+      const excluded = ["바이오", "제약", "임상", "신약", "허가", "승인", "진행", "출시", "소식", "관련", "이유", "분석", "결과", "실적", "공개"];
+      const rootKeywords = rootWords.filter(w => !excluded.includes(w));
+      const candidateKeywords = candidateWords.filter(w => !excluded.includes(w));
+      const overlapCount = rootKeywords.filter(w => candidateKeywords.includes(w)).length;
+
+      // Condition 3: Entity match
+      const candidateEntities = [...(candidate.entities?.companies || []), ...(candidate.entities?.products || [])].map(e => e.toLowerCase());
+      const hasEntityMatch = rootEntities.length > 0 && candidateEntities.some(e => rootEntities.includes(e));
+
+      // Strategy: Strong similarity OR (Medium overlap AND Entity match)
+      const similarity = overlapCount / Math.max(1, Math.min(rootKeywords.length, candidateKeywords.length));
+      
+      if (similarity >= 0.75 || (overlapCount >= 2 && hasEntityMatch)) {
         cluster.push(candidate);
         processed.add(candidate.id);
       }
@@ -162,6 +198,8 @@ export default function App() {
   const [selectedCompany, setSelectedCompany] = useState<string | null>(null);
   const [selectedSources, setSelectedSources] = useState<Set<string>>(new Set());
   const [expandedClusters, setExpandedClusters] = useState<Set<string>>(new Set());
+  const [viewClusterMode, setViewClusterMode] = useState(false);
+  const [syncMetadata, setSyncMetadata] = useState<any>(null);
   const [isSyncing, setIsSyncing] = useState(false);
   const [analyzingIds, setAnalyzingIds] = useState<Set<string>>(new Set());
   const [notifyingIds, setNotifyingIds] = useState<Set<string>>(new Set());
@@ -172,25 +210,52 @@ export default function App() {
   const [showMobileSearch, setShowMobileSearch] = useState(false);
   const [visibleCount, setVisibleCount] = useState(80);
   const [statusMessage, setStatusMessage] = useState("수집된 기사를 불러오는 중입니다.");
+  const [isBackgroundSyncing, setIsBackgroundSyncing] = useState(false);
+  const [lastSyncInfo, setLastSyncInfo] = useState<{ time: string; newCount: number } | null>(null);
 
   const sourceList = useMemo(() => Array.from(new Set(articles.map((article) => article.source))).sort(), [articles]);
 
-  const loadFromServer = async () => {
+  const loadFromServer = async (isManual = false) => {
+    if (!isManual) setIsBackgroundSyncing(true);
     try {
-      const response = await fetch("/api/articles");
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const data = await response.json();
-      setArticles(data);
-      setStatusMessage(`마지막 갱신: ${formatKST(new Date().toISOString(), "HH:mm:ss")}`);
+      const articleRes = await fetch("/api/articles");
+      if (articleRes.ok) {
+        const newData: NewsArticle[] = await articleRes.json();
+        
+        setArticles((prev) => {
+          const articleMap = new Map(prev.map(a => [a.id, a]));
+          let newItemsCount = 0;
+          
+          newData.forEach(art => {
+            if (!articleMap.has(art.id)) {
+              newItemsCount++;
+            }
+            // Overwrite existing or add new
+            articleMap.set(art.id, art);
+          });
+          
+          if (newItemsCount > 0 || isManual) {
+            setLastSyncInfo({ time: dayjs().format("HH:mm:ss"), newCount: newItemsCount });
+          }
+
+          // Return sorted array
+          return Array.from(articleMap.values()).sort((a, b) => getArticleTime(b) - getArticleTime(a));
+        });
+      }
+      
+      const metaRes = await fetch("/api/metadata/sync");
+      if (metaRes.ok) setSyncMetadata(await metaRes.json());
+      
     } catch (error) {
       console.error("Load Error:", error);
-      setStatusMessage("기사 목록을 불러오지 못했습니다.");
+    } finally {
+      setIsBackgroundSyncing(false);
     }
   };
 
   useEffect(() => {
-    loadFromServer();
-    const interval = window.setInterval(loadFromServer, 60000);
+    loadFromServer(true);
+    const interval = window.setInterval(() => loadFromServer(false), 60000);
     return () => window.clearInterval(interval);
   }, []);
 
@@ -198,7 +263,10 @@ export default function App() {
     const query = searchQuery.trim().toLowerCase();
 
     return articles.filter((article) => {
-      const articleDate = dayjs(article.publishedAt || article.fetchedAt || article.date);
+      // Use publishedAt for filtering if exists, otherwise treat as "unknown date" (always show or filter by fetchedAt if range logic allows)
+      // To satisfy "no fallback", we judge matchDate based on publishedAt if range is set.
+      // If range is NOT set, it matches. If range IS set and publishedAt is null, we use fetchedAt for the logical filter bucket.
+      const articleDate = dayjs(article.publishedAt || article.fetchedAt);
       const rangeStart = dateRange?.from ? dayjs(startOfDay(dateRange.from)) : null;
       const rangeEnd = dateRange?.to ? dayjs(dateRange.to).endOf("day") : null;
       const matchDate = (!rangeStart || articleDate.isAfter(rangeStart) || articleDate.isSame(rangeStart)) && (!rangeEnd || articleDate.isBefore(rangeEnd) || articleDate.isSame(rangeEnd));
@@ -232,7 +300,13 @@ export default function App() {
     return Array.from(companies).sort();
   }, [articles]);
 
-  const clusteredData = useMemo(() => clusterArticles(filteredArticles), [filteredArticles]);
+  const clusteredData = useMemo(() => {
+    if (viewClusterMode) return clusterArticles(filteredArticles);
+    // Flat map: each article is its own cluster
+    const clusters: Record<string, NewsArticle[]> = {};
+    filteredArticles.forEach(a => clusters[a.id] = [a]);
+    return clusters;
+  }, [filteredArticles, viewClusterMode]);
 
   const groupedArticles = useMemo(() => {
     const groups: Record<string, string[]> = {};
@@ -242,7 +316,10 @@ export default function App() {
 
     rootIds.forEach((rootId) => {
       const root = clusteredData[rootId][0];
-      const key = groupByCategory ? CATEGORIES.find((category) => category.id === root.type)?.label || "기타" : formatKST(root.publishedAt || root.fetchedAt || root.date, "YYYY.MM.DD ddd");
+      const key = groupByCategory 
+        ? (CATEGORIES.find((category) => category.id === root.type)?.label || "기타") 
+        : (root.publishedAt ? formatKST(root.publishedAt, "YYYY.MM.DD ddd") : "발행 확인 불가 (최근 수집)");
+      
       if (!groups[key]) groups[key] = [];
       groups[key].push(rootId);
     });
@@ -253,17 +330,41 @@ export default function App() {
   const syncNews = async () => {
     if (isSyncing) return;
     setIsSyncing(true);
-    setStatusMessage("뉴스 수집 중입니다. 신규 기사는 텔레그램으로 자동 전송되고, AI 분석은 수동으로 실행됩니다.");
+    setStatusMessage("전체 소스 수집 중... (백그라운드 동기화)");
 
     try {
       const response = await fetch("/api/articles/sync", { method: "POST" });
-      const result = await response.json().catch(() => ({}));
+      const result = await response.json();
       if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
-      setArticles(result.data || []);
-      setStatusMessage(`수집 완료: 새 기사 ${result.newCount || 0}건. 중복 알림은 자동으로 건너뜁니다.`);
+      
+      await loadFromServer(true);
+      
+      const stats = result.stats;
+      const failedSources = Object.keys(stats.sources).filter(k => stats.sources[k].error);
+      const msg = `수집 완료: 신규 ${stats.newArticles}건 확인. ${failedSources.length > 0 ? `(일부 실패: ${failedSources.join(", ")})` : ""}`;
+      setStatusMessage(msg);
     } catch (error: any) {
       console.error("Sync Error:", error);
       setStatusMessage(error.message || "뉴스 수집 중 오류가 발생했습니다.");
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  const revalidateTimes = async () => {
+    if (isSyncing) return;
+    setIsSyncing(true);
+    setStatusMessage("모든 기사의 발행시간을 원문에서 재파싱하고 있습니다. 잠시만 기다려주세요...");
+
+    try {
+      const response = await fetch("/api/articles/revalidate-published-at", { method: "POST" });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+      await loadFromServer();
+      setStatusMessage(`재검증 완료: 총 ${result.total}건 중 ${result.updated}건의 시간이 보정되었습니다.`);
+    } catch (error: any) {
+      console.error("Revalidation Error:", error);
+      setStatusMessage(error.message || "발행시간 재검증 중 오류가 발생했습니다.");
     } finally {
       setIsSyncing(false);
     }
@@ -408,7 +509,6 @@ export default function App() {
       제목: article.title,
       출처: article.source,
       카테고리: CATEGORIES.find((category) => category.id === article.type)?.label || "기타",
-      중요도: IMPORTANCE_LABELS[article.importance],
       회사: article.entities?.companies.join(", "),
       제품: article.entities?.products.join(", "),
       요약: article.summary,
@@ -446,22 +546,31 @@ export default function App() {
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
-          <button className="rounded-lg p-2 text-slate-500 hover:bg-slate-100 md:hidden" onClick={() => setShowMobileSearch((value) => !value)} title="검색">
-            {showMobileSearch ? <X className="h-5 w-5" /> : <Search className="h-5 w-5" />}
-          </button>
-          <button className="rounded-lg p-2 text-slate-500 hover:bg-emerald-50 hover:text-emerald-700" onClick={exportToExcel} title="엑셀 내보내기">
-            <Download className="h-5 w-5" />
-          </button>
-          <button
-            className="flex items-center gap-2 rounded-lg bg-emerald-600 px-3 py-2 text-sm font-black text-white shadow-sm transition hover:bg-emerald-700 disabled:opacity-50"
-            onClick={syncNews}
-            disabled={isSyncing}
-          >
-            <RefreshCw className={cn("h-4 w-4", isSyncing && "animate-spin")} />
-            <span className="hidden sm:inline">수동 수집</span>
-          </button>
-        </div>
+          <div className="flex items-center gap-2">
+            <button className="rounded-lg p-2 text-slate-500 hover:bg-slate-100 md:hidden" onClick={() => setShowMobileSearch((value) => !value)} title="검색">
+              {showMobileSearch ? <X className="h-5 w-5" /> : <Search className="h-5 w-5" />}
+            </button>
+            <button className="rounded-lg p-2 text-slate-500 hover:bg-emerald-50 hover:text-emerald-700" onClick={exportToExcel} title="엑셀 내보내기">
+              <Download className="h-5 w-5" />
+            </button>
+            <button
+              className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-white px-3 py-2 text-sm font-black text-emerald-700 shadow-sm transition hover:bg-emerald-50 disabled:opacity-50"
+              onClick={revalidateTimes}
+              disabled={isSyncing}
+              title="과거 기사 포함 모든 기사의 발행시간 원문 재조사"
+            >
+              <RefreshCw className={cn("h-4 w-4", isSyncing && "animate-spin")} />
+              <span className="hidden lg:inline">발행시간 재검증</span>
+            </button>
+            <button
+              className="flex items-center gap-2 rounded-lg bg-emerald-600 px-3 py-2 text-sm font-black text-white shadow-sm transition hover:bg-emerald-700 disabled:opacity-50"
+              onClick={syncNews}
+              disabled={isSyncing}
+            >
+              <RefreshCw className={cn("h-4 w-4", isSyncing && "animate-spin")} />
+              <span className="hidden sm:inline">수동 수집</span>
+            </button>
+          </div>
       </header>
 
       <AnimatePresence>
@@ -491,14 +600,22 @@ export default function App() {
               </div>
               <div className="space-y-1.5">
                 <button
-                  className={cn("flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-bold", selectedCategory === "all" && !groupByCategory ? "bg-slate-950 text-white" : "text-slate-600 hover:bg-slate-50")}
+                  className={cn("flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-bold", selectedCategory === "all" && !groupByCategory && !viewClusterMode ? "bg-slate-950 text-white" : "text-slate-600 hover:bg-slate-50")}
                   onClick={() => {
                     setSelectedCategory("all");
                     setGroupByCategory(false);
+                    setViewClusterMode(false);
                   }}
                 >
                   <Clock className="h-4 w-4" />
-                  최신순
+                  최신순 (개별)
+                </button>
+                <button 
+                  className={cn("flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-bold", viewClusterMode ? "bg-emerald-600 text-white" : "text-slate-600 hover:bg-slate-50")} 
+                  onClick={() => setViewClusterMode((v) => !v)}
+                >
+                  <Hash className="h-4 w-4" />
+                  이슈 묶음 보기
                 </button>
                 <button className={cn("flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-bold", groupByCategory ? "bg-emerald-600 text-white" : "text-slate-600 hover:bg-slate-50")} onClick={() => setGroupByCategory((value) => !value)}>
                   <Activity className="h-4 w-4" />
@@ -579,6 +696,17 @@ export default function App() {
               </div>
             </section>
 
+            <button className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-emerald-200 px-3 py-2.5 text-xs font-black uppercase tracking-wide text-emerald-600 hover:bg-emerald-50" onClick={async () => {
+              if (window.confirm("articles.json 데이터를 Firestore로 마이그레이션 하시겠습니까?")) {
+                const res = await fetch("/api/admin/migrate", { method: "POST" });
+                const result = await res.json();
+                alert(`결과: ${result.count || 0}건 마이그레이션 완료`);
+                loadFromServer();
+              }
+            }}>
+              <Download className="h-4 w-4" />
+              데이터 마이그레이션
+            </button>
             <button className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-rose-200 px-3 py-2.5 text-xs font-black uppercase tracking-wide text-rose-600 hover:bg-rose-50" onClick={clearAllArticles}>
               <Trash2 className="h-4 w-4" />
               데이터 초기화
@@ -606,29 +734,59 @@ export default function App() {
             </button>
           </div>
 
-          <div className="flex shrink-0 items-center justify-between border-b border-slate-200 bg-slate-50 px-4 py-2 text-xs font-semibold text-slate-500 lg:px-6">
-            <span>{statusMessage}</span>
-            <span>
-              표시 {Object.keys(clusteredData).length}묶음 / 전체 {articles.length}건
+          <div className="flex shrink-0 items-center justify-between border-b border-slate-200 bg-slate-50 px-4 py-2 text-[10px] font-bold text-slate-500 lg:px-6">
+            <div className="flex items-center gap-4 overflow-hidden">
+               <span className={cn("shrink-0", isBackgroundSyncing ? "text-emerald-500 animate-pulse" : "text-emerald-600")}>
+                 {isBackgroundSyncing ? "BACKGROUND SYNCING..." : "AUTO-SYNC ON"}
+               </span>
+               {syncMetadata && (
+                 <div className="flex shrink-0 items-center gap-2 border-l border-slate-300 pl-4">
+                    <span>전체:{syncMetadata.totalSources || 0}</span>
+                    <span className="text-emerald-600">성공:{syncMetadata.successCount || 0}</span>
+                    <span className="text-rose-500">실패:{syncMetadata.failCount || 0}</span>
+                    <span className="text-slate-900">신규:{syncMetadata.newArticles || 0}</span>
+                    <span className="text-blue-600">발송:{syncMetadata.sentTelegram || 0}</span>
+                 </div>
+               )}
+               <div className="flex gap-3 overflow-x-auto no-scrollbar border-l border-slate-300 pl-4">
+                  {lastSyncInfo && (
+                    <span className="text-slate-500 bg-white px-2 py-0.5 rounded border border-slate-200">
+                      Last Checked: {lastSyncInfo.time} ({lastSyncInfo.newCount > 0 ? `+${lastSyncInfo.newCount} New` : "No New"})
+                    </span>
+                  )}
+                  {syncMetadata?.sources && Object.keys(syncMetadata.sources).map(s => {
+                    const info = syncMetadata.sources[s];
+                    return (
+                      <span key={s} className={cn("inline-flex items-center gap-1 whitespace-nowrap", info.success ? "text-slate-400" : "text-rose-400")} title={info.error}>
+                        {s}({info.method})
+                        <span className="font-mono">[{info.savedCount || 0}/{info.candidateCount || 0}]</span>
+                        {info.timeout && <Clock className="h-2.5 w-2.5" />}
+                      </span>
+                    );
+                  })}
+               </div>
+            </div>
+            <span className="shrink-0 ml-4">
+              {viewClusterMode ? `${Object.keys(clusteredData).length}묶음` : `${articles.length}건`} 표시
             </span>
           </div>
 
-          <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-24 pt-5 lg:px-6">
+          <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-24 lg:px-6">
             {Object.keys(groupedArticles).length === 0 ? (
               <div className="flex h-full flex-col items-center justify-center text-slate-400">
                 <Search className="mb-4 h-14 w-14 opacity-20" />
                 <p className="text-sm font-semibold">조건에 맞는 기사가 없습니다.</p>
               </div>
             ) : (
-              <div className="space-y-8">
+              <div className="space-y-3">
                 {Object.keys(groupedArticles).map((group) => (
-                  <div key={group} className="space-y-3">
-                    <div className="sticky top-0 z-10 flex items-center gap-4 bg-slate-100/95 py-2 backdrop-blur">
-                      <span className="whitespace-nowrap text-[11px] font-black uppercase tracking-wide text-slate-400">{group}</span>
+                  <div key={group} className="space-y-2">
+                    <div className="sticky top-0 z-10 flex items-center gap-4 bg-slate-100/95 py-0.5 backdrop-blur">
+                      <span className="whitespace-nowrap text-[10px] font-black uppercase tracking-wide text-slate-400">{group}</span>
                       <div className="h-px flex-1 bg-slate-200" />
                     </div>
 
-                    <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+                    <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
                       {groupedArticles[group].map((rootId) => {
                         const cluster = clusteredData[rootId];
                         const root = cluster[0];
@@ -644,7 +802,6 @@ export default function App() {
                             >
                               <div className="mb-3 flex items-start justify-between gap-3">
                                 <div className="flex flex-wrap items-center gap-1.5">
-                                  <span className={cn("rounded-md border px-2 py-1 text-[10px] font-black", IMPORTANCE_STYLES[root.importance])}>{IMPORTANCE_LABELS[root.importance]}</span>
                                   <span className="inline-flex items-center gap-1 rounded-md bg-emerald-50 px-2 py-1 text-[10px] font-black text-emerald-700">
                                     <CategoryIcon className="h-3 w-3" />
                                     {CATEGORIES.find((category) => category.id === root.type)?.label || "기타"}
@@ -661,7 +818,17 @@ export default function App() {
                               <div className="mb-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] font-bold text-slate-400">
                                 <span className="inline-flex items-center gap-1">
                                   <Clock className="h-3.5 w-3.5" />
-                                  발행 {formatKST(root.publishedAt || root.date, "MM-DD HH:mm")}
+                                  발행 {root.publishedAt ? formatKST(root.publishedAt, "MM-DD HH:mm") : <span className="text-rose-500 font-bold">발행 확인 불가</span>}
+                                  {root.publishedAt && root.publishedAtSource && (
+                                    <span className={cn(
+                                      "ml-1 rounded px-1 text-[9px] font-medium",
+                                      root.publishedAtSource === "not_found" || root.publishedAtSource.includes("weak")
+                                        ? "bg-rose-50 text-rose-400" 
+                                        : "bg-slate-100 text-slate-400"
+                                    )} title={`출처: ${root.publishedAtSource}`}>
+                                      {root.publishedAtSource.includes("body") ? "본문" : root.publishedAtSource.includes("meta") ? "메타" : root.publishedAtSource}
+                                    </span>
+                                  )}
                                 </span>
                                 <span>수집 {formatKST(root.fetchedAt, "MM-DD HH:mm")}</span>
                                 <span className="inline-flex items-center gap-1 text-emerald-700">

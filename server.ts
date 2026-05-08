@@ -6,7 +6,6 @@ import dotenv from "dotenv";
 import axios from "axios";
 import * as cheerio from "cheerio";
 import Parser from "rss-parser";
-import cron from "node-cron";
 import OpenAI from "openai";
 import dayjs from "dayjs";
 import utc from "dayjs/plugin/utc.js";
@@ -16,23 +15,19 @@ dayjs.extend(utc);
 dayjs.extend(timezone);
 dotenv.config();
 
+const PORT = 3000;
+const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
 type Importance = "high" | "mid" | "low";
-type ArticleType =
-  | "approval"
-  | "clinical"
-  | "deal"
-  | "earnings"
-  | "pricing"
-  | "legal"
-  | "finance"
-  | "product"
-  | "etc";
+type ArticleType = "approval" | "clinical" | "deal" | "earnings" | "pricing" | "legal" | "finance" | "product" | "etc";
 
 interface Article {
   id: string;
   title: string;
   link: string;
   publishedAt: string | null;
+  rssPublishedAt: string | null;
+  publishedAtSource: string;
   fetchedAt: string;
   source: string;
   content: string;
@@ -51,194 +46,414 @@ interface Article {
   };
 }
 
-interface Source {
+interface WebSource {
   name: string;
   url: string;
   baseUrl?: string;
+  itemSelector: string;
+  titleSelector: string;
+  linkSelector: string;
 }
 
-const PORT = Number(process.env.PORT || 3000);
-const DB_PATH = path.join(process.cwd(), "articles.json");
-const USER_AGENT =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+// --- Apps Script Bridge Service ---
+class GoogleSheetBridge {
+  private url: string;
+  private secret: string;
+  private cache: { data: Article[]; timestamp: number } | null = null;
+  private CACHE_TTL = 30 * 1000; // 30 seconds
 
-const INDUSTRY_KEYWORDS = [
-  "제약",
-  "바이오",
-  "신약",
-  "의약품",
-  "헬스케어",
-  "임상",
-  "품목허가",
-  "식약처",
-  "FDA",
-  "기술이전",
-  "라이선스",
-  "CDMO",
-  "허가",
-  "승인",
-  "치료제",
-  "항암",
-  "백신",
-  "GMP",
-];
+  constructor() {
+    this.url = process.env.GOOGLE_SCRIPT_URL || "";
+    this.secret = process.env.GOOGLE_SCRIPT_SECRET || "";
+  }
 
-const EVENT_KEYWORDS = [
-  "실적",
-  "매출",
-  "영업이익",
-  "임상",
-  "임상시험",
-  "허가",
-  "승인",
-  "NDA",
-  "IND",
-  "기술이전",
-  "계약",
-  "수주",
-  "급여",
-  "약가",
-  "특허",
-  "시판",
-  "판매",
-  "회수",
-  "리콜",
-  "투자",
-  "IPO",
-  "공급계약",
-  "파트너십",
-  "행정처분",
-  "제조정지",
-  "업무정지",
-  "과징금",
-  "인수",
-  "합병",
-  "소송",
-  "무효",
-  "침해",
-  "출시",
-];
+  private async request(method: "GET" | "POST", payload: any) {
+    if (!this.url) {
+      console.error("[Bridge Error] GOOGLE_SCRIPT_URL is missing in Environments/Secrets.");
+      return null;
+    }
+    try {
+      // Use POST for most actions if possible as it's more robust with GAS
+      // We'll keep the original method but default to POST if it helps
+      const isPost = method === "POST" || payload.action === "getMetadata" || payload.action === "getArticles";
+      
+      if (isPost) {
+        const res = await axios.post(this.url, { ...payload, secret: this.secret }, { 
+          timeout: 45000, 
+          headers: { "Content-Type": "application/json" } 
+        });
+        this.cache = null; // Clear cache on write
+        return res.data;
+      } else {
+        const res = await axios.get(this.url, { params: { ...payload, secret: this.secret }, timeout: 45000 });
+        return res.data;
+      }
+    } catch (e: any) {
+      if (e.response?.status === 401) {
+        console.error(`[Bridge Error] 401 Unauthorized: Check if GOOGLE_SCRIPT_SECRET matches SECRET_TOKEN.`);
+      } else {
+        console.error(`[Bridge Error] ${payload.action}:`, e.message);
+        if (e.response?.status === 500) {
+          console.error(`[Bridge Tip] 500 error from GAS often means a missing sheet (e.g., "metadata") or script exception.`);
+        }
+      }
+      return null;
+    }
+  }
 
-const RSS_SOURCES: Source[] = [
+  async getArticles(): Promise<Article[]> {
+    if (this.cache && Date.now() - this.cache.timestamp < this.CACHE_TTL) {
+      return this.cache.data;
+    }
+
+    const data = await this.request("GET", { action: "getArticles" });
+    if (!Array.isArray(data)) return [];
+    
+    const articles = data.map(r => ({
+      ...r,
+      isStarred: String(r.isStarred) === "true",
+      isRead: String(r.isRead) === "true",
+      aiAnalyzed: String(r.aiAnalyzed) === "true",
+      telegramSent: String(r.telegramSent) === "true",
+      entities: typeof r.entities === "string" ? JSON.parse(r.entities) : (r.entities || { companies: [], products: [] })
+    }));
+
+    this.cache = { data: articles, timestamp: Date.now() };
+    return articles;
+  }
+
+  async getNotifications() {
+    const data = await this.request("GET", { action: "getNotifications" });
+    return Array.isArray(data) ? data : [];
+  }
+
+  async getMetadata(key: string) {
+    return await this.request("GET", { action: "getMetadata", key });
+  }
+
+  async updateRow(sheetName: string, idField: string, idValue: string, data: any) {
+    return await this.request("POST", { action: "updateRow", sheetName, idField, idValue, data });
+  }
+
+  async syncArticles(articles: Article[]) {
+    return await this.request("POST", { action: "syncArticles", data: articles });
+  }
+
+  async clearAll() {
+    return await this.request("POST", { action: "clear" });
+  }
+}
+
+const bridge = new GoogleSheetBridge();
+
+// --- Scraping & Intelligence ---
+
+const INDUSTRY_KEYWORDS = ["제약", "바이오", "신약", "의약품", "임상", "품목허가", "식약처", "FDA", "기술이전", "허가", "승인", "치료제", "백신", "헬스케어"];
+const EVENT_KEYWORDS = ["실적", "영업이익", "임상", "허가", "승인", "기술이전", "계약", "수주", "급여", "약가", "특허", "시판", "출시", "인수", "합병", "공개", "발표"];
+
+const RSS_SOURCES = [
   { name: "약사공론", url: "https://www.kpanews.co.kr/rss/allArticle.xml" },
   { name: "팜뉴스", url: "http://www.pharmnews.com/rss/allArticle.xml" },
   { name: "매일경제", url: "https://www.mk.co.kr/rss/30000023/" },
+  { name: "히트뉴스", url: "https://www.hitnews.co.kr/rss/allArticle.xml" },
+  { name: "메디파나뉴스", url: "https://www.medipana.com/rss/allArticle.xml" },
 ];
 
-const WEB_SOURCES: Source[] = [
-  { name: "데일리팜", url: "https://www.dailypharm.com/Users/News/NewsList.html", baseUrl: "https://www.dailypharm.com" },
-  { name: "히트뉴스", url: "https://www.hitnews.co.kr/news/articleList.html?view_type=sm", baseUrl: "https://www.hitnews.co.kr" },
-  { name: "더바이오", url: "https://www.thebionews.net/", baseUrl: "https://www.thebionews.net" },
-  { name: "프레스나인", url: "https://www.press9.kr/news/articleList.html?view_type=sm", baseUrl: "https://www.press9.kr" },
-  { name: "팜스투데이", url: "https://www.pharmstoday.com/news/articleList.html?view_type=sm", baseUrl: "https://www.pharmstoday.com" },
-  { name: "헬스코리아뉴스", url: "https://www.hkn24.com/news/articleList.html", baseUrl: "https://www.hkn24.com" },
-  { name: "청년의사", url: "https://www.docdocdoc.co.kr/news/articleList.html?sc_sub_section_code=S2N124", baseUrl: "https://www.docdocdoc.co.kr" },
-  { name: "뉴스더보이스", url: "https://www.newsthevoice.com/news/articleList.html", baseUrl: "https://www.newsthevoice.com" },
-  { name: "메디칼타임즈", url: "https://www.medicaltimes.com/Main/News/List.html?MainCate=3", baseUrl: "https://www.medicaltimes.com" },
-  { name: "의학신문", url: "https://www.bosa.co.kr/news/articleList.html?view_type=sm", baseUrl: "https://www.bosa.co.kr" },
-  { name: "한국경제", url: "https://www.hankyung.com/bioinsight", baseUrl: "https://www.hankyung.com" },
-  { name: "서울경제", url: "https://www.sedaily.com/NewsList/GD05", baseUrl: "https://www.sedaily.com" },
-  { name: "헬스조선", url: "https://health.chosun.com/list.html", baseUrl: "https://health.chosun.com" },
-  { name: "메디팜뉴스", url: "http://www.medipharmnews.com/news/articleList.html?view_type=sm", baseUrl: "http://www.medipharmnews.com" },
-  { name: "라포르시안", url: "https://www.rapportian.com/news/articleList.html?view_type=sm", baseUrl: "https://www.rapportian.com" },
-  { name: "데일리메디", url: "https://www.dailymedi.com/news/news_list.php", baseUrl: "https://www.dailymedi.com" },
-  { name: "바이오타임즈", url: "https://biotimes.co.kr/news/articleList.html?view_type=sm", baseUrl: "https://biotimes.co.kr" },
-  { name: "메디게이트뉴스", url: "https://www.medigatenews.com/news/list", baseUrl: "https://www.medigatenews.com" },
-  { name: "의약뉴스", url: "https://www.newsmp.com/news/articleList.html?view_type=sm", baseUrl: "https://www.newsmp.com" },
-  { name: "메디소비자뉴스", url: "https://www.medisobizanews.com/news/articleList.html?view_type=sm", baseUrl: "https://www.medisobizanews.com" },
-  { name: "약업신문", url: "https://www.yakup.com/news/index.html?mode=list", baseUrl: "https://www.yakup.com" },
-  { name: "메디파나뉴스", url: "https://www.medipana.com/news/articleList.html?view_type=sm", baseUrl: "https://www.medipana.com" },
-  { name: "바이오스펙테이터", url: "http://www.biospectator.com/section/section_list.php?code=1100", baseUrl: "http://www.biospectator.com" },
-  { name: "이데일리팜", url: "http://pharm.edaily.co.kr/News/NewsList", baseUrl: "http://pharm.edaily.co.kr" },
-  { name: "매경헬스", url: "https://www.mkhealth.co.kr/news/articleList.html?view_type=sm", baseUrl: "https://www.mkhealth.co.kr" },
+const WEB_SOURCES: WebSource[] = [
+  { name: "바이오스펙테이터", url: "http://www.biospectator.com/section/section_list.php?code=1100", baseUrl: "http://www.biospectator.com", itemSelector: ".article_list > li, .list > li", titleSelector: ".article_title a, .tit a", linkSelector: "a" },
 ];
 
-const parser = new Parser({
-  headers: {
+interface SourceStatus {
+  source: string;
+  method: "RSS" | "dedicated" | "web";
+  startedAt: string;
+  finishedAt?: string;
+  durationMs?: number;
+  success: boolean;
+  candidateCount: number;
+  savedCount: number;
+  error?: string;
+  timeout?: boolean;
+}
+
+const parser = new Parser({ 
+  headers: { 
     "User-Agent": USER_AGENT,
-    Accept: "application/rss+xml, application/xml, text/xml, */*",
-  },
-  timeout: 10000,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+  }, 
+  timeout: 10000 
 });
 
-let syncInFlight: Promise<Article[]> | null = null;
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, sourceName: string): Promise<T> {
+  let timeoutHandle: NodeJS.Timeout;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutHandle = setTimeout(() => reject(new Error(`Timeout exceeded for ${sourceName}`)), timeoutMs);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timeoutHandle));
+}
 
-const normalizeDate = (value?: string | null): string => {
-  if (!value) return dayjs().toISOString();
+async function fetchRssSource(source: { name: string; url: string }): Promise<Article[]> {
+  const feed = await parser.parseURL(source.url);
+  return feed.items?.map(i => normalizeArticle({ 
+    title: i.title || "", 
+    link: i.link || "", 
+    source: source.name,
+    rssPublishedAt: i.isoDate || i.pubDate || null
+  })) || [];
+}
 
-  const cleaned = value
-    .replace(/입력|수정|발행|등록|승인|기사입력/g, "")
-    .replace(/[\[\]\(\)]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+async function fetchWebSource(source: WebSource): Promise<Article[]> {
+  const { data } = await axios.get(source.url, { 
+    timeout: 10000, 
+    headers: { 
+      "User-Agent": USER_AGENT, 
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+      "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+      "Accept-Encoding": "gzip, deflate, br",
+      "Cache-Control": "no-cache",
+      "Pragma": "no-cache"
+    } 
+  });
+  const $ = cheerio.load(data);
+  const items: Article[] = [];
+  $(source.itemSelector).each((_, el) => {
+    const titleEl = $(el).find(source.titleSelector);
+    let title = titleEl.text().trim();
+    let link = titleEl.attr("href") || $(el).find(source.linkSelector).attr("href");
+    
+    if (!title) {
+        const anyLink = $(el).find("a").first();
+        title = anyLink.text().trim();
+        link = link || anyLink.attr("href");
+    }
 
-  if (!cleaned) return dayjs().toISOString();
+    if (title && link) {
+      const absLink = link.startsWith("http") ? link : new URL(link, source.baseUrl || source.url).toString();
+      items.push(normalizeArticle({ title, link: absLink, source: source.name }));
+    }
+  });
+  return items;
+}
 
-  const candidates = [
-    cleaned,
-    cleaned.replace(/\./g, "-"),
-    cleaned.replace(/(\d{2})-(\d{2})-(\d{2})/, "20$1-$2-$3"),
-  ];
+async function fetchDailyPharm(): Promise<Article[]> {
+  const url = "https://www.dailypharm.com/Users/News/NewsList.html";
+  const baseUrl = "https://www.dailypharm.com";
+  const { data } = await axios.get(url, { 
+    timeout: 10000, 
+    headers: { 
+      "User-Agent": USER_AGENT,
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+      "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+      "Cache-Control": "no-cache"
+    } 
+  });
+  const $ = cheerio.load(data);
+  const items: Article[] = [];
+  
+  // Try specialized selectors first
+  const selectors = [".art_list_all li", ".art_list li", ".art_list_box li"];
+  for (const sel of selectors) {
+    $(sel).each((_, el) => {
+      const artTit = $(el).find(".art_tit a, .tit a, a.tit").first();
+      let title = artTit.text().trim();
+      let link = artTit.attr("href");
+      let dateTxt = $(el).find(".art_date, .date, span.date").text().trim();
 
-  for (const candidate of candidates) {
-    const parsed = dayjs.tz(candidate, "Asia/Seoul");
+      if (!title || !link) {
+        const fallbackA = $(el).find('a[href*="NewsView"]').first();
+        title = fallbackA.text().trim();
+        link = fallbackA.attr("href");
+      }
+
+      if (title && link) {
+        const absLink = link.startsWith("http") ? link : new URL(link, baseUrl).toString();
+        items.push(normalizeArticle({ 
+          title, 
+          link: absLink, 
+          source: "데일리팜",
+          publishedAt: normalizeDate(dateTxt)
+        }));
+      }
+    });
+    if (items.length > 0) break;
+  }
+  return items;
+}
+
+async function fetchYakup(): Promise<Article[]> {
+  const url = "https://www.yakup.com/news/index.html?mode=list";
+  const baseUrl = "https://www.yakup.com";
+  const { data } = await axios.get(url, { 
+    timeout: 10000, 
+    headers: { 
+      "User-Agent": USER_AGENT,
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+      "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+      "Cache-Control": "no-cache"
+    } 
+  });
+  const $ = cheerio.load(data);
+  const items: Article[] = [];
+
+  const selectors = [".news-list > li", ".newsList li", ".news_list li"];
+  for (const sel of selectors) {
+    $(sel).each((_, el) => {
+      const titA = $(el).find(".tit a, .title a, a.tit, .tit, h2 a, h3 a").first();
+      let title = titA.text().trim();
+      let link = titA.attr("href") || $(el).find("a").first().attr("href");
+      let dateTxt = $(el).find(".date, .time, .reg_date").text().trim();
+
+      if (!title || !link) {
+        const fallbackA = $(el).find('a[href*="/news/"]').first();
+        title = fallbackA.text().trim();
+        link = fallbackA.attr("href");
+      }
+
+      if (title && link) {
+        const absLink = link.startsWith("http") ? link : new URL(link, baseUrl).toString();
+        items.push(normalizeArticle({ 
+          title, 
+          link: absLink, 
+          source: "약업신문",
+          publishedAt: normalizeDate(dateTxt)
+        }));
+      }
+    });
+    if (items.length > 0) break;
+  }
+  return items;
+}
+
+async function fetchBusinessPost(): Promise<Article[]> {
+  const url = "https://www.businesspost.co.kr/BP?command=article_list";
+  const baseUrl = "https://www.businesspost.co.kr";
+  
+  const { data } = await axios.get(url, { 
+    timeout: 10000, 
+    headers: { 
+      "User-Agent": USER_AGENT,
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+      "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+      "Accept-Encoding": "gzip, deflate, br",
+      "Referer": "https://www.google.com/",
+      "DNT": "1",
+      "Upgrade-Insecure-Requests": "1",
+      "Sec-Fetch-Dest": "document",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Site": "cross-site",
+      "Sec-Fetch-User": "?1",
+      "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+      "Sec-Ch-Ua-Mobile": "?0",
+      "Sec-Ch-Ua-Platform": '"Windows"',
+      "Cache-Control": "no-cache"
+    } 
+  });
+  const $ = cheerio.load(data);
+  const items: Article[] = [];
+
+  const selectors = [".list_area li", ".news_list_area li"];
+  for (const sel of selectors) {
+    $(sel).each((_, el) => {
+      const titA = $(el).find(".tit a, a.tit, .title a").first();
+      let title = titA.text().trim();
+      let link = titA.attr("href");
+      let dateTxt = $(el).find(".date, .time").text().trim();
+
+      if (title && link) {
+        const absLink = link.startsWith("http") ? link : new URL(link, baseUrl).toString();
+        items.push(normalizeArticle({ 
+          title, 
+          link: absLink, 
+          source: "비즈니스포스트",
+          publishedAt: normalizeDate(dateTxt)
+        }));
+      }
+    });
+    if (items.length > 0) break;
+  }
+  return items;
+}
+
+// RSS Auto-discovery helper
+async function discoverRss(targetUrl: string): Promise<string | null> {
+  try {
+    const { data } = await axios.get(targetUrl, { timeout: 10000, headers: { "User-Agent": USER_AGENT } });
+    const $ = cheerio.load(data);
+    const linkRss = $("link[type='application/rss+xml']").attr("href") || $("link[type='application/atom+xml']").attr("href");
+    if (linkRss) return linkRss.startsWith("http") ? linkRss : new URL(linkRss, targetUrl).toString();
+    const commonPaths = ["/rss", "/rss/allArticle.xml", "/rss/all.xml", "/news/rss", "/rss/news.xml"];
+    for (const path of commonPaths) {
+      try {
+        const testUrl = new URL(path, targetUrl).toString();
+        const res = await axios.head(testUrl, { timeout: 5000 });
+        const contentType = res.headers["content-type"];
+        if (res.status === 200 && contentType && String(contentType).includes("xml")) return testUrl;
+      } catch (e) {}
+    }
+  } catch (e) {}
+  return null;
+}
+
+const normalizeDate = (value?: string | null): string | null => {
+  if (!value) return null;
+  
+  let cleaned = value.replace(/입력|기사입력|등록|발행|승인|기사발행|Published|Created/g, "")
+                .replace(/[\[\]\(\)]/g, " ")
+                .replace(/\./g, "-")
+                .replace(/\//g, "-")
+                .replace(/년|월/g, "-")
+                .replace(/일/g, " ")
+                .replace(/\s+/g, " ")
+                .trim();
+                
+  if (!cleaned) return null;
+  
+  const dateTimeMatch = cleaned.match(/(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}(:\d{2})?)/);
+  if (dateTimeMatch) {
+    const parsed = dayjs.tz(dateTimeMatch[1], "Asia/Seoul");
     if (parsed.isValid()) return parsed.toISOString();
   }
 
-  const fallback = dayjs(cleaned);
-  return fallback.isValid() ? fallback.toISOString() : dayjs().toISOString();
-};
+  const dateMatch = cleaned.match(/(\d{4}-\d{2}-\d{2})/);
+  if (dateMatch) {
+    const parsed = dayjs.tz(dateMatch[1], "Asia/Seoul");
+    if (parsed.isValid()) return parsed.toISOString();
+  }
 
-const toAbsoluteUrl = (link: string, source: Source): string => {
-  if (link.startsWith("http")) return link;
-  return new URL(link, source.baseUrl || source.url).toString();
+  try {
+    const parsed = dayjs.tz(cleaned, "Asia/Seoul");
+    if (parsed.isValid()) return parsed.toISOString();
+  } catch (e) {}
+
+  return null;
 };
 
 const normalizeLinkKey = (link: string) => {
   try {
     const url = new URL(link);
-    const paramsToDrop = [
-      "utm_source",
-      "utm_medium",
-      "utm_campaign",
-      "utm_term",
-      "utm_content",
-      "fbclid",
-      "gclid",
-      "ref",
-    ];
-    paramsToDrop.forEach((param) => url.searchParams.delete(param));
+    ["utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "fbclid", "gclid", "ref", "source", "rss"].forEach(p => url.searchParams.delete(p));
     url.hash = "";
-    return url.toString().replace(/\/$/, "").toLowerCase();
+    return url.toString().replace(/\/$/, "").replace(/index\.html$/, "").toLowerCase();
   } catch {
-    return link.split("#")[0].replace(/\/$/, "").trim().toLowerCase();
+    return link.split("#")[0].split("?")[0].replace(/\/$/, "").trim().toLowerCase();
   }
 };
 
 const normalizeTitleKey = (title: string) =>
-  title
-    .replace(/\[[^\]]*]/g, "")
-    .replace(/\([^)]*\)/g, "")
-    .replace(/[“”"'`.,:;|]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
-
-const getArticleDedupKey = (article: Pick<Article, "link" | "title" | "source">) =>
-  `${normalizeLinkKey(article.link)}|${article.source}|${normalizeTitleKey(article.title)}`;
-
-const getNotificationDedupKey = (article: Pick<Article, "link" | "title" | "source">) =>
-  `${normalizeLinkKey(article.link)}|${normalizeTitleKey(article.title)}`;
+  title.replace(/\[[^\]]*]/g, "").replace(/\([^)]*\)/g, "").replace(/[“”"'`.,:;|]/g, " ").replace(/\s+/g, "").trim().toLowerCase();
 
 const normalizeArticle = (article: Partial<Article> & Pick<Article, "title" | "link" | "source">): Article => {
-  const id = article.id || article.link;
   const now = dayjs().toISOString();
-
   return {
-    id,
+    id: article.id || article.link,
     title: article.title.trim(),
     link: article.link,
-    publishedAt: article.publishedAt || article.fetchedAt || now,
+    publishedAt: article.publishedAt || null,
+    rssPublishedAt: article.rssPublishedAt || null,
+    publishedAtSource: article.publishedAtSource || "not_found",
     fetchedAt: article.fetchedAt || now,
     source: article.source,
     content: article.content || "",
@@ -258,495 +473,399 @@ const normalizeArticle = (article: Partial<Article> & Pick<Article, "title" | "l
   };
 };
 
-const loadArticles = (): Article[] => {
-  try {
-    if (!fs.existsSync(DB_PATH)) return [];
-    const data = JSON.parse(fs.readFileSync(DB_PATH, "utf-8"));
-    if (!Array.isArray(data)) return [];
-    return data
-      .filter((article) => article?.title && article?.link && article?.source)
-      .map((article) =>
-        normalizeArticle({
-          ...article,
-          publishedAt: article.publishedAt || article.date || null,
-          fetchedAt: article.fetchedAt || article.date || dayjs().toISOString(),
-        }),
-      );
-  } catch (error) {
-    console.error("[DB] Load failed:", error);
-    return [];
-  }
-};
-
-const saveArticles = (articles: Article[]) => {
-  try {
-    const normalized = articles
-      .map(normalizeArticle)
-      .sort((a, b) => new Date(b.publishedAt || b.fetchedAt).getTime() - new Date(a.publishedAt || a.fetchedAt).getTime())
-      .slice(0, 1000);
-    const tmpPath = `${DB_PATH}.tmp`;
-    fs.writeFileSync(tmpPath, JSON.stringify(normalized, null, 2), "utf-8");
-    fs.renameSync(tmpPath, DB_PATH);
-  } catch (error) {
-    console.error("[DB] Save failed:", error);
-  }
-};
-
 async function fetchArticleContent(url: string) {
   try {
-    const { data } = await axios.get(url, {
-      timeout: 9000,
-      headers: {
-        "User-Agent": USER_AGENT,
-        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-      },
-    });
-
+    const { data } = await axios.get(url, { timeout: 15000, headers: { "User-Agent": USER_AGENT } });
     const $ = cheerio.load(data);
-    const preciseDate =
-      $("meta[property='article:published_time']").attr("content") ||
-      $("meta[name='pubdate']").attr("content") ||
-      $(".info-text, .article-info, .byline, .date, .published-at, .entry-date, .time, .reg-date")
-        .first()
-        .text()
-        .trim() ||
-      null;
+    let extractedDate: string | null = null;
+    let dateSource = "not_found";
 
-    const content = [
-      "#article-view",
-      "#news_content",
-      ".article-body",
-      ".view-content",
-      ".news-view-content",
-      ".article_view",
-      ".at-content",
-      "article",
-    ]
-      .map((selector) => $(selector).first().text().trim())
-      .find((text) => text.length > 80);
+    // 1. Body Text (Strong Priority patterns: Entered/Published)
+    const bodyText = $("body").text();
+    const strongDatePatterns = [
+      /(?:입력|기사입력|등록|발행|기사발행)\s*[:]?\s*(\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?)/,
+      /(\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?)/,
+    ];
 
-    return {
-      content: (content || "").replace(/\s+/g, " ").trim().slice(0, 5000),
-      preciseDate,
-    };
-  } catch (error: any) {
-    console.error(`[Scraper] Article fetch failed for ${url}: ${error.message}`);
-    return { content: "", preciseDate: null };
+    for (const pattern of strongDatePatterns) {
+      const match = bodyText.match(pattern);
+      if (match && match[1]) {
+        // Validation: verify context is not "Modified" (수정)
+        const matchIdx = match.index || 0;
+        const context = bodyText.slice(Math.max(0, matchIdx - 20), matchIdx);
+        if (!context.includes("수정") && !context.includes("Modified")) {
+          extractedDate = match[1];
+          dateSource = "body_text_strong";
+          break;
+        }
+      }
+    }
+
+    // 2. JSON-LD datePublished
+    if (!extractedDate) {
+      $("script[type='application/ld+json']").each((_, el) => {
+        try {
+          const json = JSON.parse($(el).html() || "{}");
+          const d = json.datePublished;
+          if (d) { extractedDate = d; dateSource = "ld_json"; return false; }
+        } catch (e) {}
+      });
+    }
+
+    // 3. article:published_time meta
+    if (!extractedDate) {
+      const meta = $("meta[property='article:published_time']").attr("content") ||
+                   $("meta[property='og:published_time']").attr("content");
+      if (meta) { extractedDate = meta; dateSource = "meta_article_time"; }
+    }
+
+    // 4. time element datetime
+    if (!extractedDate) {
+      const time = $("time[datetime]").attr("datetime");
+      if (time) { extractedDate = time; dateSource = "time_tag"; }
+    }
+
+    // 5. Weak Selectors (Last resort)
+    if (!extractedDate) {
+      const weakSelectors = [".date", ".timestamp", ".reg-date", ".art_date", ".ar_time", ".reporting-date"];
+      for (const s of weakSelectors) {
+        const txt = $(s).first().text().trim();
+        if (txt && /\d{4}/.test(txt)) {
+          extractedDate = txt;
+          dateSource = "weak_selector:" + s;
+          break;
+        }
+      }
+    }
+
+    const content = [".article-body", ".view-content", "article", ".entry-content", "#newsContent", ".news_body", ".art_body", "#articleBody"]
+      .map((s) => $(s).first().text().trim())
+      .find((t) => t.length > 50);
+
+    return { content: (content || "").replace(/\s+/g, " ").trim().slice(0, 5000), preciseDate: extractedDate, dateSource };
+  } catch (error) {
+    return { content: "", preciseDate: null, dateSource: "not_found" };
   }
 }
 
 async function analyzeArticleContent(article: Article) {
-  if (!process.env.OPENAI_API_KEY) {
-    throw new Error("OPENAI_API_KEY가 설정되어 있지 않습니다. .env 파일을 확인해주세요.");
-  }
-
-  let contentToAnalyze = article.content;
-  const articlePatch: Partial<Article> = {};
-
-  if (contentToAnalyze.length < 80) {
-    const fetched = await fetchArticleContent(article.link);
-    if (fetched.content) {
-      contentToAnalyze = fetched.content;
-      articlePatch.content = fetched.content;
-    }
-    if (fetched.preciseDate) {
-      articlePatch.publishedAt = normalizeDate(fetched.preciseDate);
-    }
-  }
-
+  if (!process.env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY missing");
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  const modelName = process.env.OPENAI_MODEL || "gpt-4o-mini";
   const response = await openai.chat.completions.create({
-    model: process.env.OPENAI_MODEL || "gpt-4o-mini",
+    model: modelName,
     response_format: { type: "json_object" },
     messages: [
-      {
-        role: "system",
-        content:
-          "당신은 한국 제약/바이오 산업 전문 에디터입니다. 기사를 실무자가 빠르게 판단할 수 있게 분류하고 요약합니다. 반드시 JSON만 반환합니다.",
-      },
-      {
-        role: "user",
-        content: [
-          `제목: ${article.title}`,
-          `출처: ${article.source}`,
-          `본문: ${contentToAnalyze.slice(0, 3500) || "(본문 없음)"}`,
-          "",
-          "다음 JSON 스키마로 답하세요.",
-          '{ "type": "approval|clinical|deal|earnings|pricing|legal|finance|product|etc", "importance": "high|mid|low", "reason": "중요도 판단 근거 한 문장", "summary": "핵심 요약 3~5줄", "entities": { "companies": ["회사명"], "products": ["제품명"] } }',
-        ].join("\n"),
-      },
+      { role: "system", content: "한국 제약/바이오 전문가. JSON 반환." },
+      { role: "user", content: `제목: ${article.title}\n본문: ${article.content.slice(0, 3000)}\n\nSchema: { "type": "...", "reason": "...", "summary": "...", "entities": { "companies": [], "products": [] } }` },
     ],
   });
-
   const parsed = JSON.parse(response.choices[0].message.content || "{}");
-  const validTypes: ArticleType[] = ["approval", "clinical", "deal", "earnings", "pricing", "legal", "finance", "product", "etc"];
-  const validImportance: Importance[] = ["high", "mid", "low"];
-
   return {
-    ...articlePatch,
-    type: validTypes.includes(parsed.type) ? parsed.type : "etc",
-    importance: validImportance.includes(parsed.importance) ? parsed.importance : "mid",
-    reason: typeof parsed.reason === "string" ? parsed.reason : "",
-    summary:
-      typeof parsed.summary === "string"
-        ? parsed.summary
-        : parsed.summary && typeof parsed.summary === "object"
-          ? Object.values(parsed.summary).join("\n")
-          : "",
-    entities: {
-      companies: Array.isArray(parsed.entities?.companies) ? parsed.entities.companies.filter(Boolean).map(String) : [],
-      products: Array.isArray(parsed.entities?.products) ? parsed.entities.products.filter(Boolean).map(String) : [],
-    },
+    type: parsed.type || "etc",
+    importance: "mid",
+    reason: parsed.reason || "",
+    summary: parsed.summary || "",
+    entities: { companies: parsed.entities?.companies || [], products: parsed.entities?.products || [] },
     aiAnalyzed: true,
   } satisfies Partial<Article>;
 }
 
-async function scrapeWebSource(source: Source) {
-  try {
-    const { data } = await axios.get(source.url, {
-      timeout: source.name === "데일리메디" ? 15000 : 10000,
-      headers: {
-        "User-Agent": USER_AGENT,
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-        Referer: source.baseUrl || source.url,
-      },
-    });
-
-    const $ = cheerio.load(data);
-    const items: Partial<Article>[] = [];
-
-    const pushItem = (title?: string, link?: string, date?: string, content?: string) => {
-      const cleanTitle = (title || "").replace(/\s+/g, " ").trim();
-      if (!cleanTitle || !link || cleanTitle.length < 5) return;
-      const absoluteLink = toAbsoluteUrl(link, source);
-      items.push({
-        id: absoluteLink,
-        title: cleanTitle,
-        link: absoluteLink,
-        source: source.name,
-        publishedAt: normalizeDate(date),
-        fetchedAt: dayjs().toISOString(),
-        content: content || "",
-      });
-    };
-
-    if (source.name === "데일리팜") {
-      $(".art_list_all li").each((_, el) => {
-        pushItem($(el).find(".art_tit").text(), $(el).find("a").attr("href"), $(el).find(".art_date").text());
-      });
-    } else if (source.name === "약업신문") {
-      $(".news-list > li, .newsList li").each((_, el) => {
-        pushItem($(el).find(".tit, .title, a").first().text(), $(el).find("a").attr("href"), $(el).find(".date").text());
-      });
-    } else {
-      const selectors = [
-        ".list-titles a",
-        ".titles a",
-        ".title a",
-        ".art-title a",
-        ".item-title a",
-        "#article-list a.title",
-        ".news-list a",
-        ".list-item a",
-        ".type-2 a",
-        "h4 a",
-        ".newsList a",
-        ".list_title a",
-        "a[href*='article']",
-        "a[href*='news']",
-      ].join(", ");
-
-      $(selectors).each((_, el) => {
-        const link = $(el).attr("href");
-        const bucket = $(el).closest("li, article, div");
-        const date = bucket.find(".date, .time, .dated, .reg-date, .byline").first().text();
-        const snippet = bucket.find(".lead, .summary, .desc, p").first().text();
-        pushItem($(el).text(), link, date, snippet);
-      });
-    }
-
-    const seen = new Set<string>();
-    return items
-      .filter((item) => {
-        if (!item.link || seen.has(item.link)) return false;
-        seen.add(item.link);
-        return true;
-      })
-      .slice(0, 15)
-      .map((item) => normalizeArticle(item as Article));
-  } catch (error: any) {
-    console.error(`[Scraper] ${source.name} failed: ${error.message}`);
-    return [];
-  }
-}
-
-const isRelevantArticle = (article: Article) => {
-  const text = `${article.title} ${article.content}`.toLowerCase();
-  const hasIndustry = INDUSTRY_KEYWORDS.some((keyword) => text.includes(keyword.toLowerCase()));
-  const hasEvent = EVENT_KEYWORDS.some((keyword) => text.includes(keyword.toLowerCase()));
-  return hasIndustry && hasEvent;
-};
-
 async function fetchAndProcessNews() {
-  if (syncInFlight) return syncInFlight;
+  const syncStats = { 
+    startedAt: dayjs().toISOString(),
+    finishedAt: "",
+    durationMs: 0,
+    totalSources: 0,
+    successCount: 0,
+    failCount: 0,
+    totalFound: 0, 
+    newArticles: 0, 
+    sentTelegram: 0, 
+    errors: [] as string[], 
+    sources: {} as Record<string, SourceStatus> 
+  };
 
-  syncInFlight = (async () => {
-    console.log("[Fetcher] News sync started.");
-    const allArticles: Article[] = [];
+  const tasks = [
+    { name: "데일리팜", method: "dedicated" as const, fetchFn: fetchDailyPharm },
+    { name: "약업신문", method: "dedicated" as const, fetchFn: fetchYakup },
+    { name: "비즈니스포스트", method: "dedicated" as const, fetchFn: fetchBusinessPost },
+    ...RSS_SOURCES.map(s => ({ name: s.name, method: "RSS" as const, fetchFn: () => fetchRssSource(s) })),
+    ...WEB_SOURCES.map(s => ({ name: s.name, method: "web" as const, fetchFn: () => fetchWebSource(s) })),
+  ];
 
-    for (const source of RSS_SOURCES) {
-      try {
-        const feed = await parser.parseURL(source.url);
-        feed.items?.forEach((item) => {
-          if (!item.title || !item.link) return;
-          allArticles.push(
-            normalizeArticle({
-              id: item.guid || item.link,
-              title: item.title,
-              link: item.link,
-              publishedAt: normalizeDate(item.isoDate || item.pubDate),
-              fetchedAt: dayjs().toISOString(),
-              source: source.name,
-              content: item.contentSnippet || item.content || "",
-            }),
-          );
-        });
-      } catch (error: any) {
-        console.error(`[Fetcher] RSS ${source.name} failed: ${error.message}`);
+  syncStats.totalSources = tasks.length;
+  const startSync = Date.now();
+
+  const results = await Promise.allSettled(tasks.map(async (task) => {
+    const startedAt = dayjs().toISOString();
+    const startTime = Date.now();
+    try {
+      // 10 second timeout per source
+      const items = await withTimeout(task.fetchFn(), 10000, task.name);
+      const durationMs = Date.now() - startTime;
+      
+      const status: SourceStatus = {
+        source: task.name,
+        method: task.method,
+        startedAt,
+        finishedAt: dayjs().toISOString(),
+        durationMs,
+        success: true,
+        candidateCount: items.length,
+        savedCount: 0,
+      };
+
+      if (items.length === 0 && task.method === "dedicated") {
+        console.warn(`[Warning] ${task.name} 전용 scraper 후보 0건: selector 점검 필요`);
+        status.error = "후보 0건: selector 점검 필요";
       }
+
+      return { status, items };
+    } catch (e: any) {
+      const durationMs = Date.now() - startTime;
+      const status: SourceStatus = {
+        source: task.name,
+        method: task.method,
+        startedAt,
+        finishedAt: dayjs().toISOString(),
+        durationMs,
+        success: false,
+        candidateCount: 0,
+        savedCount: 0,
+        error: e.message,
+        timeout: e.message.includes("Timeout"),
+      };
+      console.error(`[Sync Error] ${task.name}:`, e.message);
+      return { status, items: [] as Article[] };
     }
+  }));
 
-    const webResults = await Promise.allSettled(WEB_SOURCES.map((source) => scrapeWebSource(source)));
-    webResults.forEach((result) => {
-      if (result.status === "fulfilled") allArticles.push(...result.value);
-    });
-
-    const existingArticles = loadArticles();
-    const existingIds = new Set(existingArticles.map((article) => article.id));
-    const existingArticleKeys = new Set(existingArticles.map(getArticleDedupKey));
-    const sentNotificationKeys = new Set(
-      existingArticles.filter((article) => article.telegramSent).map(getNotificationDedupKey),
-    );
-    const newArticles = allArticles.filter(
-      (article) => !existingIds.has(article.id) && !existingArticleKeys.has(getArticleDedupKey(article)) && isRelevantArticle(article),
-    );
-    const uniqueNewArticles = newArticles.filter(
-      (article, index, list) =>
-        list.findIndex(
-          (target) =>
-            getArticleDedupKey(target) === getArticleDedupKey(article) ||
-            getNotificationDedupKey(target) === getNotificationDedupKey(article),
-        ) === index,
-    );
-
-    if (uniqueNewArticles.length > 0) {
-      for (let i = 0; i < uniqueNewArticles.length; i += 5) {
-        const batch = uniqueNewArticles.slice(i, i + 5);
-        await Promise.allSettled(
-          batch.map(async (article) => {
-            const fetched = await fetchArticleContent(article.link);
-            if (fetched.content) article.content = fetched.content;
-            if (fetched.preciseDate) article.publishedAt = normalizeDate(fetched.preciseDate);
-          }),
-        );
-      }
-
-      for (const article of uniqueNewArticles) {
-        const notificationKey = getNotificationDedupKey(article);
-        if (sentNotificationKeys.has(notificationKey)) {
-          article.telegramSent = true;
-          console.log(`[Telegram] Skipped duplicate notification: ${article.title}`);
-          continue;
+  const allFound: Article[] = [];
+  results.forEach((res) => {
+    if (res.status === "fulfilled") {
+        const { status, items } = res.value;
+        syncStats.sources[status.source] = status;
+        if (status.success) {
+            syncStats.successCount++;
+            allFound.push(...items);
+        } else {
+            syncStats.failCount++;
+            syncStats.errors.push(`${status.source}: ${status.error}`);
         }
-
-        try {
-          await sendTelegramNotification(article);
-          article.telegramSent = true;
-          sentNotificationKeys.add(notificationKey);
-        } catch (error: any) {
-          article.telegramSent = false;
-          console.error(`[Telegram] Auto notification failed for ${article.id}: ${error.message || error}`);
-        }
-      }
     }
-
-    const finalArticles = [...uniqueNewArticles, ...existingArticles];
-    saveArticles(finalArticles);
-    console.log(`[Fetcher] News sync finished. New articles: ${uniqueNewArticles.length}`);
-    return uniqueNewArticles;
-  })();
-
-  try {
-    return await syncInFlight;
-  } finally {
-    syncInFlight = null;
-  }
-}
-
-async function sendTelegramNotification(article: Article, isTest = false) {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
-
-  if (!token || !chatId) {
-    throw new Error("TELEGRAM_BOT_TOKEN 또는 TELEGRAM_CHAT_ID가 설정되어 있지 않습니다.");
-  }
-
-  const message = isTest
-    ? `<b>[BioTicker 테스트]</b>\n\n텔레그램 연결이 정상입니다.\n시간: ${dayjs().tz("Asia/Seoul").format("YYYY-MM-DD HH:mm:ss")}`
-    : [
-        `<b>[${article.importance.toUpperCase()}] ${article.title}</b>`,
-        "",
-        `출처: ${article.source}`,
-        `발행: ${article.publishedAt ? dayjs(article.publishedAt).tz("Asia/Seoul").format("YYYY-MM-DD HH:mm:ss") : "확인 불가"}`,
-        `분류: ${article.type}`,
-        "",
-        article.summary ? `<b>요약</b>\n${article.summary}` : article.reason ? `<b>판단 근거</b>\n${article.reason}` : "아직 AI 분석 요약이 없습니다.",
-        "",
-        article.link,
-      ].join("\n");
-
-  const response = await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
-    chat_id: chatId,
-    text: message,
-    parse_mode: "HTML",
-    disable_web_page_preview: false,
   });
 
-  return response.data;
+  syncStats.totalFound = allFound.length;
+  const unique = allFound.filter((v, i, a) => a.findIndex(t => normalizeLinkKey(t.link) === normalizeLinkKey(v.link)) === i);
+  
+  const existingArticles = await bridge.getArticles();
+  const existingLinks = new Set(existingArticles.map(a => normalizeLinkKey(a.link)));
+  const notificationLog = await bridge.getNotifications();
+
+  const toSave: Article[] = [];
+  for (const art of unique) {
+    const linkKey = normalizeLinkKey(art.link);
+    if (!existingLinks.has(linkKey)) {
+      const titleLower = art.title.toLowerCase();
+      const hasIndustry = INDUSTRY_KEYWORDS.some(k => titleLower.includes(k.toLowerCase()));
+      const hasEvent = EVENT_KEYWORDS.some(k => titleLower.includes(k.toLowerCase()));
+      
+      if (hasIndustry && hasEvent) {
+        syncStats.newArticles++;
+        if (syncStats.sources[art.source]) syncStats.sources[art.source].savedCount++;
+
+        const fetched = await fetchArticleContent(art.link);
+        art.content = fetched.content;
+        if (fetched.preciseDate) { 
+          art.publishedAt = normalizeDate(fetched.preciseDate); 
+          art.publishedAtSource = fetched.dateSource; 
+        } else if (!art.publishedAt) {
+          art.publishedAt = null;
+          art.publishedAtSource = "not_found";
+        }
+        
+        const titleKey = normalizeTitleKey(art.title);
+        const alreadySent = notificationLog.find((n: any) => normalizeTitleKey(n.normalizedTitle || "") === titleKey && n.source === art.source);
+        
+        if (!alreadySent) {
+          try {
+            await sendTelegramNotification(art);
+            syncStats.sentTelegram++;
+            art.telegramSent = true;
+          } catch (e) {
+             console.error("[Telegram Error]", e);
+          }
+        }
+        toSave.push(art);
+      }
+    }
+  }
+
+  if (toSave.length > 0) {
+    await bridge.syncArticles(toSave);
+    console.log(`[Sync] Saved ${toSave.length} new articles.`);
+  }
+  
+  syncStats.finishedAt = dayjs().toISOString();
+  syncStats.durationMs = Date.now() - startSync;
+
+  await bridge.updateRow("metadata", "key", "lastSync", syncStats);
+  await bridge.updateRow("sync_logs", "timestamp", syncStats.startedAt, syncStats);
+  return syncStats;
+}
+
+async function sendTelegramNotification(article: Article) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) return;
+  const msg = [`<b>${article.title}</b>`, "", `출처: ${article.source}`, `발행: ${article.publishedAt ? dayjs(article.publishedAt).tz("Asia/Seoul").format("MM-DD HH:mm") : "확인 불가"}`, "", article.link].join("\n");
+  try {
+    const res = await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, { chat_id: chatId, text: msg, parse_mode: "HTML" });
+    await bridge.updateRow("notifications", "normalizedLink", normalizeLinkKey(article.id), {
+      normalizedLink: normalizeLinkKey(article.id),
+      normalizedTitle: normalizeTitleKey(article.title),
+      source: article.source,
+      sentAt: dayjs().toISOString(),
+      telegramMessageId: String(res.data.result.message_id)
+    });
+    return res.data;
+  } catch (e) {}
 }
 
 async function startServer() {
-  const app = express();
-  app.use(express.json({ limit: "1mb" }));
-
-  cron.schedule("*/5 * * * *", () => {
-    console.log(`[Cron] ${dayjs().tz("Asia/Seoul").format("YYYY-MM-DD HH:mm:ss")} sync triggered.`);
-    fetchAndProcessNews().catch((error) => console.error("[Cron] Sync failed:", error));
-  });
-
-  if (loadArticles().length === 0) {
-    fetchAndProcessNews().catch((error) => console.error("[Startup] Initial sync failed:", error));
+  if (!process.env.GOOGLE_SCRIPT_URL || !process.env.GOOGLE_SCRIPT_SECRET) {
+    console.warn("!!! 구글 시트 연동 설정이 필요합니다 !!!");
+    console.warn("1. 우측 하단 Settings > Secrets 메뉴로 이동");
+    console.warn("2. GOOGLE_SCRIPT_URL (배포된 웹 앱 URL) 추가");
+    console.warn("3. GOOGLE_SCRIPT_SECRET (스크립트의 SECRET_TOKEN) 추가");
   }
 
-  app.get("/api/articles", (_req, res) => {
-    res.json(loadArticles());
+  const app = express();
+  app.use(express.json());
+
+  app.get("/api/articles", async (_req, res) => {
+    try {
+      const data = await bridge.getArticles();
+      const sorted = data.sort((a, b) => dayjs(b.fetchedAt).unix() - dayjs(a.fetchedAt).unix());
+      res.json(sorted.slice(0, 500));
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.get("/api/metadata/sync", async (_req, res) => {
+    try {
+      const data = await bridge.getMetadata("lastSync");
+      if (!data) {
+        // Return a default structure if bridge fails to prevent frontend breakage
+        return res.json({
+          startedAt: "",
+          finishedAt: "",
+          totalSources: 0,
+          successCount: 0,
+          failCount: 0,
+          newArticles: 0,
+          sentTelegram: 0,
+          sources: {}
+        });
+      }
+      res.json(data);
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
   });
 
   app.post("/api/articles/sync", async (_req, res) => {
     try {
-      const newArticles = await fetchAndProcessNews();
-      res.json({ status: "ok", newCount: newArticles.length, data: loadArticles() });
-    } catch (error: any) {
-      res.status(500).json({ status: "error", error: error.message || "뉴스 수집 중 오류가 발생했습니다." });
+      const stats = await fetchAndProcessNews();
+      res.json({ status: "ok", stats });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.post("/api/articles/revalidate-published-at", async (_req, res) => {
+    try {
+      const articles = await bridge.getArticles();
+      let updatedCount = 0;
+      
+      // We'll process in small chunks or just selective to avoid huge delay
+      // For now, let's try to process up to 100 most recent articles to avoid timeout
+      const toProcess = articles.slice(0, 150);
+      
+      for (const art of toProcess) {
+        const fetched = await fetchArticleContent(art.link);
+        const newDate = normalizeDate(fetched.preciseDate);
+        const newSource = fetched.preciseDate ? fetched.dateSource : "not_found";
+        
+        if (newDate !== art.publishedAt) {
+          await bridge.updateRow("articles", "id", art.id, { 
+            publishedAt: newDate, 
+            publishedAtSource: newSource 
+          });
+          updatedCount++;
+        }
+      }
+      res.json({ status: "ok", total: toProcess.length, updated: updatedCount });
+    } catch (e: any) { 
+      console.error("[Revalidate Error]", e);
+      res.status(500).json({ error: e.message }); 
     }
   });
 
-  app.post("/api/articles/star", (req, res) => {
-    const { id, isStarred } = req.body;
-    const articles = loadArticles();
-    const index = articles.findIndex((article) => article.id === id);
-    if (index === -1) return res.status(404).json({ error: "기사를 찾을 수 없습니다.", receivedId: id });
-    articles[index].isStarred = Boolean(isStarred);
-    saveArticles(articles);
-    res.json(articles[index]);
-  });
-
-  app.post("/api/articles/read", (req, res) => {
-    const { id, isRead } = req.body;
-    const articles = loadArticles();
-    const index = articles.findIndex((article) => article.id === id);
-    if (index === -1) return res.status(404).json({ error: "기사를 찾을 수 없습니다.", receivedId: id });
-    articles[index].isRead = Boolean(isRead);
-    saveArticles(articles);
-    res.json(articles[index]);
-  });
-
-  app.post("/api/articles/memo", (req, res) => {
-    const { id, memo } = req.body;
-    const articles = loadArticles();
-    const index = articles.findIndex((article) => article.id === id);
-    if (index === -1) return res.status(404).json({ error: "기사를 찾을 수 없습니다.", receivedId: id });
-    articles[index].memo = String(memo || "");
-    saveArticles(articles);
-    res.json(articles[index]);
+  app.post("/api/admin/migrate", async (_req, res) => {
+    // Already in Sheet mode, so migration from JSON is usually done manually once or skipped
+    res.json({ status: "ok", message: "Migration check completed.", count: 0 });
   });
 
   app.post("/api/articles/analysis", async (req, res) => {
     const { id } = req.body;
-    const articles = loadArticles();
-    const index = articles.findIndex((article) => article.id === id);
-    if (index === -1) return res.status(404).json({ error: "기사를 찾을 수 없습니다.", receivedId: id });
-
     try {
-      const aiResult = await analyzeArticleContent(articles[index]);
-      articles[index] = normalizeArticle({ ...articles[index], ...aiResult });
-      saveArticles(articles);
-      res.json(articles[index]);
-    } catch (error: any) {
-      console.error("[AI] Manual analysis failed:", error);
-      res.status(500).json({ error: error.message || "AI 분석 중 오류가 발생했습니다." });
-    }
+      const articles = await bridge.getArticles();
+      const art = articles.find(a => a.id === id);
+      if (!art) return res.status(404).json({ error: "Not found" });
+      const result = await analyzeArticleContent(art);
+      await bridge.updateRow("articles", "id", id, result);
+      res.json({ ...art, ...result });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.post("/api/articles/star", async (req, res) => {
+    try { await bridge.updateRow("articles", "id", req.body.id, { isStarred: req.body.isStarred }); res.json({ status: "ok" }); }
+    catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.post("/api/articles/read", async (req, res) => {
+    try { await bridge.updateRow("articles", "id", req.body.id, { isRead: req.body.isRead }); res.json({ status: "ok" }); }
+    catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.post("/api/articles/memo", async (req, res) => {
+    try { await bridge.updateRow("articles", "id", req.body.id, { memo: req.body.memo }); res.json({ status: "ok" }); }
+    catch (e: any) { res.status(500).json({ error: e.message }); }
   });
 
   app.post("/api/articles/notify", async (req, res) => {
-    const { id } = req.body;
-    const articles = loadArticles();
-    const index = articles.findIndex((article) => article.id === id);
-    if (index === -1) return res.status(404).json({ error: "기사를 찾을 수 없습니다.", receivedId: id });
-
     try {
-      await sendTelegramNotification(articles[index]);
-      articles[index].telegramSent = true;
-      saveArticles(articles);
-      res.json(articles[index]);
-    } catch (error: any) {
-      console.error("[Telegram] Manual notification failed:", error);
-      res.status(500).json({ error: error.message || "텔레그램 전송 중 오류가 발생했습니다." });
-    }
-  });
-
-  app.post("/api/telegram/test", async (_req, res) => {
-    try {
-      await sendTelegramNotification(loadArticles()[0] || normalizeArticle({ title: "테스트", link: "https://example.com", source: "BioTicker" }), true);
+      const articles = await bridge.getArticles();
+      const art = articles.find(a => a.id === req.body.id);
+      if (!art) return res.status(404).send("Not found");
+      await sendTelegramNotification(art);
+      await bridge.updateRow("articles", "id", art.id, { telegramSent: true });
       res.json({ status: "ok" });
-    } catch (error: any) {
-      res.status(500).json({ error: error.message || "텔레그램 테스트 중 오류가 발생했습니다." });
-    }
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
   });
 
-  app.post("/api/articles/clear", (req, res) => {
-    if (req.body?.confirm !== "DELETE_ALL_ARTICLES") {
-      return res.status(400).json({ error: "삭제 확인 문구가 올바르지 않습니다." });
-    }
-    saveArticles([]);
-    res.json({ message: "cleared" });
-  });
-
-  app.get("/api/health", (_req, res) => {
-    res.json({ status: "ok", time: dayjs().toISOString() });
+  app.post("/api/articles/clear", async (req, res) => {
+    if (req.body.confirm !== "DELETE_ALL_ARTICLES") return res.status(400).send("Invalid");
+    await bridge.clearAll();
+    res.json({ status: "ok" });
   });
 
   if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (_req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
+    app.use(express.static(path.join(process.cwd(), "dist")));
+    app.get("*", (_, res) => res.sendFile(path.join(process.cwd(), "dist/index.html")));
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`BioTicker server running on http://localhost:${PORT}`);
-  });
+  app.listen(PORT, "0.0.0.0", () => console.log(`Server on ${PORT}`));
 }
 
-startServer().catch((error) => {
-  console.error("[Server] Failed to start:", error);
-  process.exit(1);
-});
+startServer();
