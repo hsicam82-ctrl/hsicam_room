@@ -28,6 +28,12 @@ function doPost(e) {
       return handleSyncArticles(spreadsheet, data);
     } else if (action === "updateRow") {
       return handleUpdateRow(spreadsheet, payload.sheetName, payload.idField, payload.idValue, data);
+    } else if (action === "appendSyncLog") {
+      return appendSyncLog(spreadsheet, data);
+    } else if (action === "upsertMetadata") {
+      return upsertMetadata(spreadsheet, payload.key, payload.value);
+    } else if (action === "appendNotification") {
+      return appendNotification(spreadsheet, data);
     } else if (action === "clear") {
       return handleClear(spreadsheet);
     }
@@ -81,7 +87,7 @@ function handleSyncArticles(spreadsheet, articles) {
   let sheet = spreadsheet.getSheetByName("articles");
   if (!sheet) {
     sheet = spreadsheet.insertSheet("articles");
-    sheet.appendRow(["id", "title", "link", "source", "publishedAt", "fetchedAt", "importance", "telegramSent", "type", "summary", "aiAnalyzed", "entities", "content", "reason", "memo", "isStarred", "isRead"]);
+    sheet.appendRow(["id", "title", "link", "source", "publishedAt", "rssPublishedAt", "publishedAtSource", "publishedAtConfidence", "fetchedAt", "importance", "telegramSent", "type", "summary", "aiAnalyzed", "entities", "content", "reason", "memo", "isStarred", "isRead"]);
   }
   
   const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
@@ -92,6 +98,71 @@ function handleSyncArticles(spreadsheet, articles) {
     });
     sheet.appendRow(row);
   });
+  return respond({ status: "ok" });
+}
+
+function ensureSchema(sheet, headers) {
+  const currentLastRow = sheet.getLastRow();
+  if (currentLastRow === 0) {
+    sheet.appendRow(headers);
+    return headers;
+  }
+  const currentHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const missing = headers.filter(h => !currentHeaders.includes(h));
+  if (missing.length > 0) {
+    sheet.getRange(1, currentHeaders.length + 1, 1, missing.length).setValues([missing]);
+    return currentHeaders.concat(missing);
+  }
+  return currentHeaders;
+}
+
+function upsertMetadata(spreadsheet, key, value) {
+  let sheet = spreadsheet.getSheetByName("metadata");
+  if (!sheet) sheet = spreadsheet.insertSheet("metadata");
+  const headers = ensureSchema(sheet, ["key", "value", "updatedAt"]);
+  const rows = sheet.getDataRange().getValues();
+  const keyIndex = headers.indexOf("key");
+  const valueIndex = headers.indexOf("value");
+  const updatedAtIndex = headers.indexOf("updatedAt");
+  const rowIndex = rows.findIndex((r, i) => i > 0 && r[keyIndex] == key);
+  const serialized = typeof value === "object" ? JSON.stringify(value) : String(value || "");
+  if (rowIndex === -1) {
+    const newRow = headers.map(() => "");
+    newRow[keyIndex] = key;
+    newRow[valueIndex] = serialized;
+    newRow[updatedAtIndex] = new Date().toISOString();
+    sheet.appendRow(newRow);
+  } else {
+    sheet.getRange(rowIndex + 1, valueIndex + 1).setValue(serialized);
+    sheet.getRange(rowIndex + 1, updatedAtIndex + 1).setValue(new Date().toISOString());
+  }
+  return respond({ status: "ok" });
+}
+
+function appendSyncLog(spreadsheet, data) {
+  let sheet = spreadsheet.getSheetByName("sync_logs");
+  if (!sheet) sheet = spreadsheet.insertSheet("sync_logs");
+  const headers = ensureSchema(sheet, ["timestamp", "startedAt", "finishedAt", "durationMs", "totalSources", "successCount", "failCount", "totalFound", "newArticles", "sentTelegram", "errorsJson", "sourcesJson"]);
+  const row = headers.map(h => {
+    if (h === "timestamp") return data.startedAt || new Date().toISOString();
+    if (h === "errorsJson") return JSON.stringify(data.errors || []);
+    if (h === "sourcesJson") return JSON.stringify(data.sources || {});
+    const val = data[h];
+    return typeof val === "object" ? JSON.stringify(val) : (val === undefined ? "" : val);
+  });
+  sheet.appendRow(row);
+  return respond({ status: "ok" });
+}
+
+function appendNotification(spreadsheet, data) {
+  let sheet = spreadsheet.getSheetByName("notifications");
+  if (!sheet) sheet = spreadsheet.insertSheet("notifications");
+  const headers = ensureSchema(sheet, ["dedupKey", "normalizedLink", "normalizedTitle", "source", "articleId", "sentAt", "telegramMessageId", "status", "errorMessage", "force", "trigger"]);
+  const row = headers.map(h => {
+    const val = data[h];
+    return typeof val === "object" ? JSON.stringify(val) : (val === undefined ? "" : val);
+  });
+  sheet.appendRow(row);
   return respond({ status: "ok" });
 }
 

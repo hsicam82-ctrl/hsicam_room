@@ -28,6 +28,7 @@ interface Article {
   publishedAt: string | null;
   rssPublishedAt: string | null;
   publishedAtSource: string;
+  publishedAtConfidence: "high" | "medium" | "low" | "none";
   fetchedAt: string;
   source: string;
   content: string;
@@ -133,6 +134,15 @@ class GoogleSheetBridge {
 
   async updateRow(sheetName: string, idField: string, idValue: string, data: any) {
     return await this.request("POST", { action: "updateRow", sheetName, idField, idValue, data });
+  }
+  async appendSyncLog(data: any) {
+    return await this.request("POST", { action: "appendSyncLog", data });
+  }
+  async upsertMetadata(key: string, value: any) {
+    return await this.request("POST", { action: "upsertMetadata", key, value });
+  }
+  async appendNotification(data: any) {
+    return await this.request("POST", { action: "appendNotification", data });
   }
 
   async syncArticles(articles: Article[]) {
@@ -454,6 +464,7 @@ const normalizeArticle = (article: Partial<Article> & Pick<Article, "title" | "l
     publishedAt: article.publishedAt || null,
     rssPublishedAt: article.rssPublishedAt || null,
     publishedAtSource: article.publishedAtSource || "not_found",
+    publishedAtConfidence: article.publishedAtConfidence || "none",
     fetchedAt: article.fetchedAt || now,
     source: article.source,
     content: article.content || "",
@@ -473,7 +484,49 @@ const normalizeArticle = (article: Partial<Article> & Pick<Article, "title" | "l
   };
 };
 
-async function fetchArticleContent(url: string) {
+const MIN_CONTENT_LENGTH = 120;
+
+const SOURCE_CONTENT_SELECTORS: Record<string, string[]> = {
+  "약사공론": [".article-view", ".view_con", "#articleBody", ".news_body"],
+  "팜뉴스": [".article-body", ".view-content", ".news-view", "#articleBody"],
+  "히트뉴스": [".article-body", ".view-content", ".news_body", "#newsContent"],
+  "메디파나뉴스": [".view-content", ".article-body", ".news_body", "#newsContent"],
+  "데일리팜": [".newsCnt", ".news_contents", ".article-body", "#articleBody"],
+  "약업신문": [".news_content", ".article-body", ".view-content", "#articleBody"],
+};
+
+function normalizeContentText(text: string) {
+  return text
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]*\n[ \t]*/g, "\n")
+    .replace(/\u00a0/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function extractCleanedContent($: cheerio.CheerioAPI, source: string) {
+  $("script, style, noscript, iframe, nav, footer, header, aside").remove();
+  $("[class*='ad' i], [id*='ad' i], [class*='banner' i], [id*='banner' i], [class*='google' i], [id*='google' i], [class*='ads' i], [id*='ads' i]").remove();
+
+  const sourceSelectors = SOURCE_CONTENT_SELECTORS[source] || [];
+  const baseSelectors = ["article", "main", ".article-body", ".news-body", ".news_body", ".view-content", ".entry-content", "#articleBody", "#newsContent"];
+  const selectors = [...sourceSelectors, ...baseSelectors];
+
+  for (const sel of selectors) {
+    const node = $(sel).first();
+    if (!node || node.length === 0) continue;
+    const text = normalizeContentText(node.text());
+    if (text.length >= MIN_CONTENT_LENGTH) return text.slice(0, 5000);
+  }
+
+  const fallback = normalizeContentText($("body").text());
+  return fallback.length >= MIN_CONTENT_LENGTH ? fallback.slice(0, 5000) : "";
+}
+
+async function fetchArticleContent(url: string, source: string) {
   try {
     const { data } = await axios.get(url, { timeout: 15000, headers: { "User-Agent": USER_AGENT } });
     const $ = cheerio.load(data);
@@ -538,13 +591,56 @@ async function fetchArticleContent(url: string) {
       }
     }
 
-    const content = [".article-body", ".view-content", "article", ".entry-content", "#newsContent", ".news_body", ".art_body", "#articleBody"]
-      .map((s) => $(s).first().text().trim())
-      .find((t) => t.length > 50);
+    const content = extractCleanedContent($, source);
 
-    return { content: (content || "").replace(/\s+/g, " ").trim().slice(0, 5000), preciseDate: extractedDate, dateSource };
+    const confidence = dateSource === "body_text_strong" || dateSource === "ld_json" || dateSource === "meta_article_time" || dateSource === "time_tag"
+      ? "high"
+      : dateSource.startsWith("weak_selector:")
+      ? "low"
+      : "none";
+    return { content, preciseDate: extractedDate, dateSource, confidence };
   } catch (error) {
-    return { content: "", preciseDate: null, dateSource: "not_found" };
+    return { content: "", preciseDate: null, dateSource: "not_found", confidence: "none" as const };
+  }
+}
+
+const buildNotificationDedup = (article: Pick<Article, "link" | "title" | "source">) => {
+  const normalizedLink = normalizeLinkKey(article.link);
+  const normalizedTitle = normalizeTitleKey(article.title);
+  const dedupKey = `${normalizedLink}::${normalizedTitle}::${article.source.toLowerCase()}`;
+  return { dedupKey, normalizedLink, normalizedTitle };
+};
+
+async function sendTelegramWithDedup(article: Article, force = false, trigger: "auto_sync" | "manual" = "manual") {
+  const logRows = await bridge.getNotifications();
+  const { dedupKey, normalizedLink, normalizedTitle } = buildNotificationDedup(article);
+  const alreadySent = logRows.some((n: any) => String(n.dedupKey || "") === dedupKey && String(n.status || "sent") === "sent");
+  if (alreadySent && !force) return { status: "skipped_duplicate" as const, dedupKey };
+
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) {
+    await bridge.appendNotification({
+      dedupKey, normalizedLink, normalizedTitle, source: article.source, articleId: article.id,
+      sentAt: dayjs().toISOString(), telegramMessageId: "", status: "failed", errorMessage: "missing telegram env", force: String(force), trigger
+    });
+    return { status: "failed" as const, dedupKey };
+  }
+
+  const msg = [`<b>${article.title}</b>`, "", `출처: ${article.source}`, `발행: ${article.publishedAt ? dayjs(article.publishedAt).tz("Asia/Seoul").format("MM-DD HH:mm") : "확인 불가"}`, "", article.link].join("\n");
+  try {
+    const res = await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, { chat_id: chatId, text: msg, parse_mode: "HTML" });
+    await bridge.appendNotification({
+      dedupKey, normalizedLink, normalizedTitle, source: article.source, articleId: article.id,
+      sentAt: dayjs().toISOString(), telegramMessageId: String(res.data.result.message_id), status: "sent", errorMessage: "", force: String(force), trigger
+    });
+    return { status: "sent" as const, dedupKey };
+  } catch (e: any) {
+    await bridge.appendNotification({
+      dedupKey, normalizedLink, normalizedTitle, source: article.source, articleId: article.id,
+      sentAt: dayjs().toISOString(), telegramMessageId: "", status: "failed", errorMessage: e?.message || "unknown error", force: String(force), trigger
+    });
+    return { status: "failed" as const, dedupKey };
   }
 }
 
@@ -661,7 +757,6 @@ async function fetchAndProcessNews() {
   
   const existingArticles = await bridge.getArticles();
   const existingLinks = new Set(existingArticles.map(a => normalizeLinkKey(a.link)));
-  const notificationLog = await bridge.getNotifications();
 
   const toSave: Article[] = [];
   for (const art of unique) {
@@ -675,7 +770,7 @@ async function fetchAndProcessNews() {
         syncStats.newArticles++;
         if (syncStats.sources[art.source]) syncStats.sources[art.source].savedCount++;
 
-        const fetched = await fetchArticleContent(art.link);
+          const fetched = await fetchArticleContent(art.link, art.source);
         art.content = fetched.content;
         if (fetched.preciseDate) { 
           art.publishedAt = normalizeDate(fetched.preciseDate); 
@@ -685,17 +780,11 @@ async function fetchAndProcessNews() {
           art.publishedAtSource = "not_found";
         }
         
-        const titleKey = normalizeTitleKey(art.title);
-        const alreadySent = notificationLog.find((n: any) => normalizeTitleKey(n.normalizedTitle || "") === titleKey && n.source === art.source);
-        
-        if (!alreadySent) {
-          try {
-            await sendTelegramNotification(art);
-            syncStats.sentTelegram++;
-            art.telegramSent = true;
-          } catch (e) {
-             console.error("[Telegram Error]", e);
-          }
+        art.publishedAtConfidence = fetched.confidence || "none";
+        const notifyResult = await sendTelegramWithDedup(art, false, "auto_sync");
+        if (notifyResult.status === "sent") {
+          syncStats.sentTelegram++;
+          art.telegramSent = true;
         }
         toSave.push(art);
       }
@@ -710,27 +799,9 @@ async function fetchAndProcessNews() {
   syncStats.finishedAt = dayjs().toISOString();
   syncStats.durationMs = Date.now() - startSync;
 
-  await bridge.updateRow("metadata", "key", "lastSync", syncStats);
-  await bridge.updateRow("sync_logs", "timestamp", syncStats.startedAt, syncStats);
+  await bridge.upsertMetadata("lastSync", syncStats);
+  await bridge.appendSyncLog(syncStats);
   return syncStats;
-}
-
-async function sendTelegramNotification(article: Article) {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
-  if (!token || !chatId) return;
-  const msg = [`<b>${article.title}</b>`, "", `출처: ${article.source}`, `발행: ${article.publishedAt ? dayjs(article.publishedAt).tz("Asia/Seoul").format("MM-DD HH:mm") : "확인 불가"}`, "", article.link].join("\n");
-  try {
-    const res = await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, { chat_id: chatId, text: msg, parse_mode: "HTML" });
-    await bridge.updateRow("notifications", "normalizedLink", normalizeLinkKey(article.id), {
-      normalizedLink: normalizeLinkKey(article.id),
-      normalizedTitle: normalizeTitleKey(article.title),
-      source: article.source,
-      sentAt: dayjs().toISOString(),
-      telegramMessageId: String(res.data.result.message_id)
-    });
-    return res.data;
-  } catch (e) {}
 }
 
 async function startServer() {
@@ -789,7 +860,7 @@ async function startServer() {
       const toProcess = articles.slice(0, 150);
       
       for (const art of toProcess) {
-        const fetched = await fetchArticleContent(art.link);
+        const fetched = await fetchArticleContent(art.link, art.source);
         const newDate = normalizeDate(fetched.preciseDate);
         const newSource = fetched.preciseDate ? fetched.dateSource : "not_found";
         
@@ -814,7 +885,7 @@ async function startServer() {
   });
 
   app.post("/api/articles/analysis", async (req, res) => {
-    const { id } = req.body;
+      const { id, force } = req.body;
     try {
       const articles = await bridge.getArticles();
       const art = articles.find(a => a.id === id);
@@ -845,9 +916,15 @@ async function startServer() {
       const articles = await bridge.getArticles();
       const art = articles.find(a => a.id === req.body.id);
       if (!art) return res.status(404).send("Not found");
-      await sendTelegramNotification(art);
-      await bridge.updateRow("articles", "id", art.id, { telegramSent: true });
-      res.json({ status: "ok" });
+      const result = await sendTelegramWithDedup(art, Boolean(force), "manual");
+      if (result.status === "sent") {
+        await bridge.updateRow("articles", "id", art.id, { telegramSent: true });
+        return res.json({ ...art, telegramSent: true, notifyStatus: "sent" });
+      }
+      if (result.status === "skipped_duplicate") {
+        return res.status(409).json({ error: "이미 전송된 기사입니다. force=true로만 재전송 가능합니다.", notifyStatus: "skipped_duplicate" });
+      }
+      return res.status(500).json({ error: "텔레그램 전송 실패", notifyStatus: "failed" });
     } catch (e: any) { res.status(500).json({ error: e.message }); }
   });
 
