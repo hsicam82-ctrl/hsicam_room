@@ -49,6 +49,7 @@ interface NewsArticle {
   publishedAt: string | null;
   rssPublishedAt: string | null;
   publishedAtSource: string;
+  publishedAtConfidence?: "high" | "medium" | "low" | "none";
   fetchedAt: string;
   date?: string;
   source: string;
@@ -122,9 +123,7 @@ function formatKST(dateStr: string | null | undefined, formatStr = "YYYY-MM-DD H
 }
 
 function getArticleTime(article: NewsArticle) {
-  // Priority: publishedAt > fetchedAt
-  if (article.publishedAt) return new Date(article.publishedAt).getTime();
-  return new Date(article.fetchedAt || 0).getTime();
+  return new Date((article.publishedAt || article.fetchedAt) || 0).getTime();
 }
 
 function normalizeForCluster(title: string) {
@@ -210,6 +209,7 @@ export default function App() {
   const [showMobileSearch, setShowMobileSearch] = useState(false);
   const [visibleCount, setVisibleCount] = useState(80);
   const [statusMessage, setStatusMessage] = useState("수집된 기사를 불러오는 중입니다.");
+  const [includeUnknownPublishedAt, setIncludeUnknownPublishedAt] = useState(false);
   const [isBackgroundSyncing, setIsBackgroundSyncing] = useState(false);
   const [lastSyncInfo, setLastSyncInfo] = useState<{ time: string; newCount: number } | null>(null);
 
@@ -266,10 +266,15 @@ export default function App() {
       // Use publishedAt for filtering if exists, otherwise treat as "unknown date" (always show or filter by fetchedAt if range logic allows)
       // To satisfy "no fallback", we judge matchDate based on publishedAt if range is set.
       // If range is NOT set, it matches. If range IS set and publishedAt is null, we use fetchedAt for the logical filter bucket.
-      const articleDate = dayjs(article.publishedAt || article.fetchedAt);
+      const articleDate = article.publishedAt ? dayjs(article.publishedAt) : null;
       const rangeStart = dateRange?.from ? dayjs(startOfDay(dateRange.from)) : null;
       const rangeEnd = dateRange?.to ? dayjs(dateRange.to).endOf("day") : null;
-      const matchDate = (!rangeStart || articleDate.isAfter(rangeStart) || articleDate.isSame(rangeStart)) && (!rangeEnd || articleDate.isBefore(rangeEnd) || articleDate.isSame(rangeEnd));
+      const hasDateFilter = Boolean(rangeStart || rangeEnd);
+      const matchDate = !hasDateFilter
+        ? (article.publishedAt ? true : includeUnknownPublishedAt)
+        : (articleDate
+          ? ((!rangeStart || articleDate.isAfter(rangeStart) || articleDate.isSame(rangeStart)) && (!rangeEnd || articleDate.isBefore(rangeEnd) || articleDate.isSame(rangeEnd)))
+          : includeUnknownPublishedAt);
 
       const text = [
         article.title,
@@ -292,7 +297,7 @@ export default function App() {
 
       return matchDate && matchSearch && matchCategory && matchStarred && matchUnread && matchSource && matchCompany;
     });
-  }, [articles, dateRange, searchQuery, selectedCategory, selectedCompany, selectedSources, viewStarredOnly, viewUnreadOnly]);
+  }, [articles, dateRange, includeUnknownPublishedAt, searchQuery, selectedCategory, selectedCompany, selectedSources, viewStarredOnly, viewUnreadOnly]);
 
   const allCompanies = useMemo(() => {
     const companies = new Set<string>();
@@ -726,6 +731,9 @@ export default function App() {
               <button className={cn("rounded-lg border px-3 py-2 text-xs font-black", groupByCategory ? "border-emerald-600 bg-emerald-600 text-white" : "border-slate-200 bg-white text-slate-600")} onClick={() => setGroupByCategory((value) => !value)}>
                 카테고리별
               </button>
+              <button className={cn("rounded-lg border px-3 py-2 text-xs font-black", includeUnknownPublishedAt ? "border-rose-500 bg-rose-500 text-white" : "border-slate-200 bg-white text-slate-600")} onClick={() => setIncludeUnknownPublishedAt((value) => !value)}>
+                발행시간 미확인 포함
+              </button>
             </div>
 
             <button className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-black text-slate-700 shadow-sm hover:bg-slate-50" onClick={() => setShowCalendar(true)}>
@@ -818,7 +826,7 @@ export default function App() {
                               <div className="mb-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] font-bold text-slate-400">
                                 <span className="inline-flex items-center gap-1">
                                   <Clock className="h-3.5 w-3.5" />
-                                  발행 {root.publishedAt ? formatKST(root.publishedAt, "MM-DD HH:mm") : <span className="text-rose-500 font-bold">발행 확인 불가</span>}
+                                  발행 {root.publishedAt ? formatKST(root.publishedAt, "MM-DD HH:mm") : <span className="text-rose-500 font-bold">발행시간 미확인</span>}
                                   {root.publishedAt && root.publishedAtSource && (
                                     <span className={cn(
                                       "ml-1 rounded px-1 text-[9px] font-medium",
@@ -828,6 +836,9 @@ export default function App() {
                                     )} title={`출처: ${root.publishedAtSource}`}>
                                       {root.publishedAtSource.includes("body") ? "본문" : root.publishedAtSource.includes("meta") ? "메타" : root.publishedAtSource}
                                     </span>
+                                  )}
+                                  {!root.publishedAt && (
+                                    <span className="ml-1 rounded bg-rose-50 px-1 text-[9px] font-semibold text-rose-500">발행시간 미확인</span>
                                   )}
                                 </span>
                                 <span>수집 {formatKST(root.fetchedAt, "MM-DD HH:mm")}</span>
